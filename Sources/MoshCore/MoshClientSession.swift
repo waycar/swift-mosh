@@ -51,6 +51,17 @@ public actor MoshClientSession {
     private var currentRtoMs: Double
 
     private var appliedRemoteStateNums: Set<UInt64> = []
+    /// Set when a received state was not applied: it repeats one already
+    /// applied, or its base is a state this client never received. Either
+    /// way the server's picture of what we hold is behind, so it needs a
+    /// fresh ack promptly instead of waiting out the periodic ack interval.
+    /// (Waycar patch.)
+    private var reackRequested = false
+    /// Set when the server announced shutdown with the maximum state number.
+    /// (Waycar patch.)
+    private var remoteShutdownReceived = false
+    private static let reackSpacingMs: UInt64 = 20
+    private static let shutdownAckRepeats = 2
 
     private var consecutiveReceiveFailures: UInt32 = 0
 
@@ -404,8 +415,16 @@ public actor MoshClientSession {
                 publishHostOps(hostOps)
             }
 
+            let now = TransportClock.nowMs()
             if ackDirtyAtMs != nil, latestReceivedStateNum > lastAckReportedNum {
-                try? await sendAckOnly(nowMs: TransportClock.nowMs())
+                try? await sendAckOnly(nowMs: now)
+            } else if reackRequested, now >= lastAckSentAtMs, now - lastAckSentAtMs >= Self.reackSpacingMs {
+                try? await sendAckOnly(nowMs: now)
+            }
+
+            if remoteShutdownReceived {
+                await finishAfterRemoteShutdown()
+                return false
             }
         } catch {
             if Task.isCancelled || state == .stopping || state == .stopped {
@@ -664,7 +683,7 @@ public actor MoshClientSession {
         }
         if debugEnabled {
             debugLog(
-                "decodeHostOps payloadLen=\(incoming.payload.count) decompressedLen=\(decompressed?.count ?? -1) instructionLen=\(instructionBytes.count)"
+                "decodeHostOps payloadLen=\(incoming.payload.count) decompressedLen=\(decompressed?.count ?? -1) instructionLen=\(instructionBytes.count) old=\(instruction.oldNum.map(String.init) ?? "-") new=\(instruction.newNum.map(String.init) ?? "-") ack=\(instruction.ackNum.map(String.init) ?? "-") throwaway=\(instruction.throwawayNum.map(String.init) ?? "-") diffLen=\(instruction.diff?.count ?? -1)"
             )
         }
 
@@ -680,12 +699,27 @@ public actor MoshClientSession {
         }
 
         if let newNum = instruction.newNum {
-            if appliedRemoteStateNums.contains(newNum) {
+            if appliedRemoteStateNums.contains(newNum) || newNum <= latestReceivedStateNum {
+                // Already shown (or superseded): the server resent it because
+                // it missed our ack. Applying an older state would roll the
+                // screen back. (Waycar patch: skip and re-ack.)
+                reackRequested = true
                 return []
             }
             if let oldNum = instruction.oldNum, oldNum > latestReceivedStateNum {
+                // Built on a state this client never received. (Waycar patch:
+                // re-ack so the server re-bases on one we hold.)
+                reackRequested = true
                 return []
             }
+            // A base older than our latest state is applied on top of the
+            // newer screen, as upstream does. mosh-server falls back to our
+            // last acknowledged state whenever acks trail its patience, which
+            // is routine once round-trip time is a few hundred milliseconds;
+            // dropping those states until it re-bases measured ~1 frame/s and
+            // 3.5 s of lag at 250 ms RTT. The cost: a cell that changed and
+            // changed back between the base and this state can keep its
+            // intermediate content until redrawn (see PROVENANCE.md).
             latestReceivedStateNum = max(latestReceivedStateNum, newNum)
             appliedRemoteStateNums.insert(newNum)
             if appliedRemoteStateNums.count > 4096 {
@@ -693,6 +727,13 @@ public actor MoshClientSession {
                 appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= floor })
             }
             ackDirtyAtMs = TransportClock.nowMs()
+            if newNum == UInt64.max {
+                // The server's shutdown state: its command exited. It carries
+                // the final screen diff like any other state. Acking the
+                // maximum number lets mosh-server exit; the receive loop then
+                // ends the session. (Waycar patch.)
+                remoteShutdownReceived = true
+            }
         }
 
         guard let diff = instruction.diff else {
@@ -792,6 +833,10 @@ public actor MoshClientSession {
     }
 
     private func maybeSendAck(nowMs: UInt64) async throws {
+        if reackRequested, nowMs >= lastAckSentAtMs, nowMs - lastAckSentAtMs >= Self.reackSpacingMs {
+            try await sendAckOnly(nowMs: nowMs)
+            return
+        }
         guard let ackDirtyAtMs else {
             if nowMs >= lastAckSentAtMs,
                nowMs - lastAckSentAtMs >= UInt64(config.ackIntervalMs),
@@ -826,6 +871,7 @@ public actor MoshClientSession {
         lastAckSentAtMs = nowMs
         lastAckReportedNum = latestReceivedStateNum
         ackDirtyAtMs = nil
+        reackRequested = false
     }
 
     private func sendAckOnly(nowMs: UInt64) async throws {
@@ -842,6 +888,7 @@ public actor MoshClientSession {
         lastAckSentAtMs = nowMs
         lastAckReportedNum = latestReceivedStateNum
         ackDirtyAtMs = nil
+        reackRequested = false
     }
 
     private func applySendMinDelayIfNeeded() async throws {
@@ -942,6 +989,21 @@ public actor MoshClientSession {
         self.failure = failure
         state = .failed(failure)
         await shutdownRuntime()
+    }
+
+    /// The server's shutdown state was applied and acked: resend the ack a
+    /// few times so a lost datagram does not leave mosh-server waiting, then
+    /// stop the runtime and finish the host streams. The session ends
+    /// `.stopped` with no failure because the remote command ended normally.
+    /// (Waycar patch.)
+    private func finishAfterRemoteShutdown() async {
+        state = .stopping
+        for _ in 0..<Self.shutdownAckRepeats {
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            try? await sendAckOnly(nowMs: TransportClock.nowMs())
+        }
+        await shutdownRuntime()
+        state = .stopped
     }
 
     private enum ReceiveErrorDisposition {

@@ -382,6 +382,14 @@ public actor TransportEngine {
     private var assembly: MoshFragmentAssembly
     private var snapshot: TransportRuntimeSnapshot
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+    /// The peer's latest packet timestamp and when it arrived, echoed once in
+    /// the next outgoing packet's timestamp-reply field (adjusted by how long
+    /// it was held) so the peer can measure round-trip time. mosh-server
+    /// paces its frames from that estimate; without replies it stays at its
+    /// slowest frame interval. (Waycar patch; upstream v0.1.8 always sent
+    /// "no reply".)
+    private var pendingPeerTimestamp: (timestamp: UInt16, receivedAtMs: UInt64)?
+    private static let maximumTimestampHoldMs: UInt64 = 1_000
 
     public init(endpoint: any DatagramEndpoint, outgoingDirection: MoshDirection, mtu: Int = 1200, cipher: (any TransportCipher)? = nil) {
         self.endpoint = endpoint
@@ -419,7 +427,9 @@ public actor TransportEngine {
         snapshot.nextInstructionID &+= 1
 
         let fragments = try fragmenter.makeFragments(messageID: messageID, encodedInstruction: payload, mtu: mtu - MoshWire.packetHeaderBytes)
-        let timestamp = MoshWire.timestamp16(nowMilliseconds: TransportClock.nowMs())
+        let nowMs = TransportClock.nowMs()
+        let timestamp = MoshWire.timestamp16(nowMilliseconds: nowMs)
+        let timestampReply = takeTimestampReply(nowMs: nowMs)
         var currentSequence = sequence
 
         for index in fragments.indices {
@@ -429,7 +439,7 @@ public actor TransportEngine {
             if let cipher {
                 var plaintext = Data()
                 plaintext.appendBigEndian(timestamp)
-                plaintext.appendBigEndian(UInt16.max)
+                plaintext.appendBigEndian(timestampReply)
                 plaintext.append(fragment.encoded())
                 let sealed = try cipher.seal(directionalSequence: dirSeq, plaintext: plaintext)
                 try await endpoint.send(sealed)
@@ -438,7 +448,7 @@ public actor TransportEngine {
                     sequence: currentSequence,
                     direction: outgoingDirection,
                     timestamp: timestamp,
-                    timestampReply: UInt16.max,
+                    timestampReply: timestampReply,
                     payload: fragment.encoded()
                 )
                 try await endpoint.send(MoshPacketCodec.encode(packet))
@@ -451,6 +461,18 @@ public actor TransportEngine {
         }
 
         snapshot.lastSentAtMs = TransportClock.nowMs()
+    }
+
+    /// The held peer timestamp advanced by its hold time, or "no reply"
+    /// (`UInt16.max`) when none is held or it is too old to be a fair sample.
+    /// Each received timestamp is echoed at most once.
+    private func takeTimestampReply(nowMs: UInt64) -> UInt16 {
+        guard let held = pendingPeerTimestamp else { return UInt16.max }
+        pendingPeerTimestamp = nil
+        guard nowMs >= held.receivedAtMs else { return UInt16.max }
+        let holdMs = nowMs - held.receivedAtMs
+        guard holdMs < Self.maximumTimestampHoldMs else { return UInt16.max }
+        return held.timestamp &+ UInt16(truncatingIfNeeded: holdMs)
     }
 
     public func receivePayload() async throws -> TransportReceivedPayload {
@@ -487,6 +509,9 @@ public actor TransportEngine {
                     debugLog("drop direction packet dir=\(packet.direction) expected=\(expectedIncomingDirection)")
                 }
                 continue
+            }
+            if packet.timestamp != UInt16.max {
+                pendingPeerTimestamp = (packet.timestamp, datagram.receivedAtMs)
             }
 
             let fragment = try MoshFragment(decoding: packet.payload)
