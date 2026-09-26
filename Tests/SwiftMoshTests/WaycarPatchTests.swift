@@ -26,7 +26,7 @@ final class WaycarPatchTests: XCTestCase {
         XCTAssertEqual(state, .stopped)
         let failure = await session.failure
         XCTAssertNil(failure, "a server that shut down ended the session normally")
-        let acked = await waitUntil(within: 1) { await log.acks(since: 0).contains(UInt64.max) }
+        let acked = await waitUntil(within: 1) { await log.acks(after: 0).contains(UInt64.max) }
         XCTAssertTrue(acked, "the shutdown state must be acknowledged so mosh-server can exit")
 
         await serverEnd.stop()
@@ -43,14 +43,14 @@ final class WaycarPatchTests: XCTestCase {
         let recorder = recordAcks(from: server, into: log)
 
         try await sendState(from: server, old: 0, new: 1, text: "A")
-        let firstAck = await waitUntil(within: 1) { await log.acks(since: 0).contains(1) }
+        let firstAck = await waitUntil(within: 1) { await log.acks(after: 0).contains(1) }
         XCTAssertTrue(firstAck)
-        let droppedAt = TransportClock.nowMs()
+        let before = await log.count()
         // State 5 never arrived, so a diff built on it is unusable.
         try await sendState(from: server, old: 5, new: 6, text: "unusable")
 
         // Upstream waits out the 5 s ack interval before telling the server again.
-        let reacked = await waitUntil(within: 1) { await log.acks(since: droppedAt).contains(1) }
+        let reacked = await waitUntil(within: 1) { await log.acks(after: before).contains(1) }
         XCTAssertTrue(reacked, "the client must re-ack its latest state promptly so the server re-bases")
         let applied = await session.drainHostOps()
         XCTAssertEqual(applied, [.hostBytes(Data("A".utf8))])
@@ -58,6 +58,80 @@ final class WaycarPatchTests: XCTestCase {
         await session.stop()
         await serverEnd.stop()
         await recorder.value
+    }
+
+    func testRepeatedOlderStateIsDroppedAndPromptlyReacked() async throws {
+        var config = MoshClientConfig()
+        config.ackDelayMs = 5_000
+        config.ackIntervalMs = 5_000
+        config.heartbeatIntervalMs = 5_000
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        let log = AckLog()
+        let recorder = recordAcks(from: server, into: log)
+
+        try await sendState(from: server, old: 0, new: 1, text: "A")
+        let firstAck = await waitUntil(within: 1) { await log.acks(after: 0).contains(1) }
+        XCTAssertTrue(firstAck)
+        try await sendState(from: server, old: 1, new: 3, text: "C")
+        let secondAck = await waitUntil(within: 1) { await log.acks(after: 0).contains(3) }
+        XCTAssertTrue(secondAck)
+        let before = await log.count()
+        // A resend of state 2, which state 3 already superseded.
+        try await sendState(from: server, old: 0, new: 2, text: "B")
+
+        // Upstream applies it (rolling the screen back) and, with 3 already
+        // acked, sends no ack until the 5 s interval.
+        let reacked = await waitUntil(within: 1) { await log.acks(after: before).contains(3) }
+        XCTAssertTrue(reacked, "the client must re-ack its latest state promptly so the server stops resending")
+        let applied = await session.drainHostOps()
+        XCTAssertEqual(applied, [.hostBytes(Data("A".utf8)), .hostBytes(Data("C".utf8))])
+
+        await session.stop()
+        await serverEnd.stop()
+        await recorder.value
+    }
+
+    func testStopCancelsStartWaitingForTheNetwork() async throws {
+        let endpoint = NeverReadyDatagramEndpoint()
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(
+                host: "127.0.0.1", port: 60001,
+                keyBase64_22: try MoshBase64Key(raw: Data(repeating: 0x42, count: 16)).printable),
+            config: MoshClientConfig(),
+            endpointFactory: { _, _ in endpoint },
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+        )
+        let (finished, finish) = AsyncStream<Void>.makeStream()
+        let start = Task {
+            defer { finish.finish() }
+            try await session.start()
+        }
+        let waiting = await waitUntil(within: 1) { await endpoint.isWaitingToStart }
+        XCTAssertTrue(waiting, "start() must be waiting on its endpoint before the stop")
+
+        await session.stop()
+
+        // Upstream's stop() cannot reach the endpoint start() waits on, so
+        // start() never returns.
+        let returned = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in finished {}
+                return !Task.isCancelled
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        XCTAssertTrue(returned, "start() must end promptly once the session is stopped")
+        if returned, case .success = await start.result {
+            XCTFail("start() must not report success for a session stopped while starting")
+        }
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
     }
 
     func testTimestampReplyEchoesPeerTimestampOnceAdjustedForHoldTime() async throws {
@@ -89,15 +163,51 @@ final class WaycarPatchTests: XCTestCase {
 
     // MARK: - Helpers
 
+    /// Ack numbers the client sent, in arrival order.
     private actor AckLog {
-        private var entries: [(atMs: UInt64, ackNum: UInt64)] = []
+        private var entries: [UInt64] = []
 
         func record(_ ackNum: UInt64) {
-            entries.append((TransportClock.nowMs(), ackNum))
+            entries.append(ackNum)
         }
 
-        func acks(since timeMs: UInt64) -> [UInt64] {
-            entries.filter { $0.atMs >= timeMs }.map(\.ackNum)
+        func count() -> Int {
+            entries.count
+        }
+
+        /// Ack numbers recorded after the first `index` entries.
+        func acks(after index: Int) -> [UInt64] {
+            Array(entries.dropFirst(index))
+        }
+    }
+
+    /// An endpoint whose network path never becomes ready, like
+    /// `NetworkDatagramEndpoint` offline or for a host that does not
+    /// resolve: `start()` waits until `stop()` cancels it.
+    private actor NeverReadyDatagramEndpoint: DatagramEndpoint {
+        private var startContinuation: CheckedContinuation<Void, Error>?
+
+        var isWaitingToStart: Bool {
+            startContinuation != nil
+        }
+
+        func start() async throws {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                startContinuation = continuation
+            }
+        }
+
+        func stop() async {
+            startContinuation?.resume(throwing: TransportError.cancelled)
+            startContinuation = nil
+        }
+
+        func send(_ data: Data) async throws {
+            throw TransportError.notStarted
+        }
+
+        func receive() async throws -> TransportDatagram {
+            throw TransportError.notStarted
         }
     }
 

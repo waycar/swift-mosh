@@ -427,6 +427,8 @@ public actor TransportEngine {
         snapshot.nextInstructionID &+= 1
 
         let fragments = try fragmenter.makeFragments(messageID: messageID, encodedInstruction: payload, mtu: mtu - MoshWire.packetHeaderBytes)
+        // (Waycar patch) One clock read for the timestamp and the reply's
+        // hold time; the reply echoes the peer's held timestamp.
         let nowMs = TransportClock.nowMs()
         let timestamp = MoshWire.timestamp16(nowMilliseconds: nowMs)
         let timestampReply = takeTimestampReply(nowMs: nowMs)
@@ -439,7 +441,7 @@ public actor TransportEngine {
             if let cipher {
                 var plaintext = Data()
                 plaintext.appendBigEndian(timestamp)
-                plaintext.appendBigEndian(timestampReply)
+                plaintext.appendBigEndian(timestampReply) // (Waycar patch)
                 plaintext.append(fragment.encoded())
                 let sealed = try cipher.seal(directionalSequence: dirSeq, plaintext: plaintext)
                 try await endpoint.send(sealed)
@@ -448,7 +450,7 @@ public actor TransportEngine {
                     sequence: currentSequence,
                     direction: outgoingDirection,
                     timestamp: timestamp,
-                    timestampReply: timestampReply,
+                    timestampReply: timestampReply, // (Waycar patch)
                     payload: fragment.encoded()
                 )
                 try await endpoint.send(MoshPacketCodec.encode(packet))
@@ -465,14 +467,18 @@ public actor TransportEngine {
 
     /// The held peer timestamp advanced by its hold time, or "no reply"
     /// (`UInt16.max`) when none is held or it is too old to be a fair sample.
-    /// Each received timestamp is echoed at most once.
+    /// Each received timestamp is echoed at most once. (Waycar patch.)
     private func takeTimestampReply(nowMs: UInt64) -> UInt16 {
         guard let held = pendingPeerTimestamp else { return UInt16.max }
         pendingPeerTimestamp = nil
         guard nowMs >= held.receivedAtMs else { return UInt16.max }
         let holdMs = nowMs - held.receivedAtMs
         guard holdMs < Self.maximumTimestampHoldMs else { return UInt16.max }
-        return held.timestamp &+ UInt16(truncatingIfNeeded: holdMs)
+        let reply = held.timestamp &+ UInt16(truncatingIfNeeded: holdMs)
+        // `UInt16.max` on the wire means "no reply", so a reply that lands on
+        // it steps back one millisecond, as `MoshWire.timestamp16` does for
+        // outgoing timestamps. (Waycar patch.)
+        return reply == UInt16.max ? UInt16.max &- 1 : reply
     }
 
     public func receivePayload() async throws -> TransportReceivedPayload {
@@ -510,6 +516,8 @@ public actor TransportEngine {
                 }
                 continue
             }
+            // (Waycar patch) Hold the peer's timestamp for the next outgoing
+            // packet's reply field, skipping `UInt16.max`, the wire's "none".
             if packet.timestamp != UInt16.max {
                 pendingPeerTimestamp = (packet.timestamp, datagram.receivedAtMs)
             }

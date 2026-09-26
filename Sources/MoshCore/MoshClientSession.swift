@@ -27,6 +27,13 @@ public actor MoshClientSession {
     private(set) public var failure: MoshSessionFailure?
 
     private var engine: TransportEngine?
+    /// The engine that `start()` or a transport restart is still connecting.
+    /// Its `start()` waits for the network path to become ready, which never
+    /// happens offline or when the host does not resolve, so
+    /// `shutdownRuntime()` and `suspendRuntime()` stop it to cancel that
+    /// wait. (Waycar patch; upstream's `stop()` could not reach this engine,
+    /// so `start()` never returned.)
+    private var startingEngine: TransportEngine?
     private var receiveTask: Task<Void, Never>?
     private var maintenanceTask: Task<Void, Never>?
 
@@ -102,6 +109,12 @@ public actor MoshClientSession {
         if case .starting = state {
             return
         }
+        // (Waycar patch) Starting while `stop()` is still tearing down races
+        // it: the new runtime could come up and then lose its engine to
+        // `shutdownRuntime()` without that engine being stopped.
+        if case .stopping = state {
+            throw MoshSessionError.notStarted
+        }
         if case .suspending = state {
             throw MoshSessionError.notStarted
         }
@@ -118,36 +131,55 @@ public actor MoshClientSession {
 
         state = .starting
 
+        let engine: TransportEngine
         do {
-            let engine = try makeTransportEngine()
+            engine = try makeTransportEngine()
+        } catch {
+            state = .idle
+            throw error
+        }
+
+        // (Waycar patch) Held in `startingEngine` across every suspension
+        // below so a concurrent `stop()` can cancel the start; after each exit
+        // from them `finishStarting` releases it and says whether the start
+        // still stands.
+        startingEngine = engine
+        do {
             try await engine.start()
 
             if let pendingTransportSnapshot {
                 await engine.restore(from: pendingTransportSnapshot)
                 self.pendingTransportSnapshot = nil
             }
-
-            self.engine = engine
-            let now = TransportClock.nowMs()
-            lastOutboundAtMs = now
-            lastStateSendAtMs = 0
-            lastAckSentAtMs = now
-            ackDirtyAtMs = latestReceivedStateNum > lastAckReportedNum ? now : nil
-            consecutiveReceiveFailures = 0
-            currentRtoMs = Double(config.initialRtoMs)
-            srttMs = nil
-            rttvarMs = nil
-
-            state = .running
-            self.receiveTask = Task { [weak self] in
-                await self?.receiveLoop()
-            }
-            self.maintenanceTask = Task { [weak self] in
-                await self?.maintenanceLoop()
-            }
         } catch {
+            guard finishStarting(engine) else { throw MoshSessionError.notStarted }
             state = .idle
             throw error
+        }
+        guard finishStarting(engine) else {
+            // (Waycar patch) Stopped after the engine came up: stop it here
+            // too, in case the stop reached it before its start finished.
+            await engine.stop()
+            throw MoshSessionError.notStarted
+        }
+
+        self.engine = engine
+        let now = TransportClock.nowMs()
+        lastOutboundAtMs = now
+        lastStateSendAtMs = 0
+        lastAckSentAtMs = now
+        ackDirtyAtMs = latestReceivedStateNum > lastAckReportedNum ? now : nil
+        consecutiveReceiveFailures = 0
+        currentRtoMs = Double(config.initialRtoMs)
+        srttMs = nil
+        rttvarMs = nil
+
+        state = .running
+        self.receiveTask = Task { [weak self] in
+            await self?.receiveLoop()
+        }
+        self.maintenanceTask = Task { [weak self] in
+            await self?.maintenanceLoop()
         }
     }
 
@@ -415,6 +447,9 @@ public actor MoshClientSession {
                 publishHostOps(hostOps)
             }
 
+            // (Waycar patch) Re-ack a state that was not applied right away
+            // rather than on the maintenance loop's next pass, at most once
+            // per `reackSpacingMs`.
             let now = TransportClock.nowMs()
             if ackDirtyAtMs != nil, latestReceivedStateNum > lastAckReportedNum {
                 try? await sendAckOnly(nowMs: now)
@@ -422,6 +457,8 @@ public actor MoshClientSession {
                 try? await sendAckOnly(nowMs: now)
             }
 
+            // (Waycar patch) The server's shutdown state was applied and acked
+            // above: finish the session.
             if remoteShutdownReceived {
                 await finishAfterRemoteShutdown()
                 return false
@@ -482,6 +519,12 @@ public actor MoshClientSession {
         while state == .running, !Task.isCancelled {
             do {
                 let replacement = try makeTransportEngine()
+                // (Waycar patch) Cancellable by `stop()` or suspension while
+                // it connects, as in `start()`.
+                startingEngine = replacement
+                defer {
+                    if startingEngine === replacement { startingEngine = nil }
+                }
                 try await replacement.start()
                 await replacement.restore(from: snapshot)
                 guard state == .running, !Task.isCancelled else {
@@ -682,6 +725,8 @@ public actor MoshClientSession {
             instruction = try TransportInstruction(decoding: instructionBytes)
         }
         if debugEnabled {
+            // (Waycar patch) The line also carries the instruction's state
+            // numbers.
             debugLog(
                 "decodeHostOps payloadLen=\(incoming.payload.count) decompressedLen=\(decompressed?.count ?? -1) instructionLen=\(instructionBytes.count) old=\(instruction.oldNum.map(String.init) ?? "-") new=\(instruction.newNum.map(String.init) ?? "-") ack=\(instruction.ackNum.map(String.init) ?? "-") throwaway=\(instruction.throwawayNum.map(String.init) ?? "-") diffLen=\(instruction.diff?.count ?? -1)"
             )
@@ -833,6 +878,8 @@ public actor MoshClientSession {
     }
 
     private func maybeSendAck(nowMs: UInt64) async throws {
+        // (Waycar patch) A state that was not applied asks for a prompt ack;
+        // see `reackRequested`.
         if reackRequested, nowMs >= lastAckSentAtMs, nowMs - lastAckSentAtMs >= Self.reackSpacingMs {
             try await sendAckOnly(nowMs: nowMs)
             return
@@ -871,7 +918,7 @@ public actor MoshClientSession {
         lastAckSentAtMs = nowMs
         lastAckReportedNum = latestReceivedStateNum
         ackDirtyAtMs = nil
-        reackRequested = false
+        reackRequested = false // (Waycar patch)
     }
 
     private func sendAckOnly(nowMs: UInt64) async throws {
@@ -888,7 +935,7 @@ public actor MoshClientSession {
         lastAckSentAtMs = nowMs
         lastAckReportedNum = latestReceivedStateNum
         ackDirtyAtMs = nil
-        reackRequested = false
+        reackRequested = false // (Waycar patch)
     }
 
     private func applySendMinDelayIfNeeded() async throws {
@@ -955,12 +1002,35 @@ public actor MoshClientSession {
         }
     }
 
+    /// Ends `start()`'s hold on `engine` after a suspension. Returns false
+    /// when the start was cancelled meanwhile: `shutdownRuntime()` took the
+    /// engine (a `stop()`, a failure, or the remote shutdown), a later
+    /// `start()` replaced it, or the state left `.starting`. `start()` then
+    /// throws `MoshSessionError.notStarted` and leaves the state alone: it
+    /// belongs to whoever stopped the session. Throwing rather than returning
+    /// tells a caller awaiting `start()` that the session is not running.
+    /// (Waycar patch.)
+    private func finishStarting(_ engine: TransportEngine) -> Bool {
+        guard startingEngine === engine else { return false }
+        startingEngine = nil
+        return state == .starting
+    }
+
+    /// Stops the engine a start or transport restart is still connecting;
+    /// its pending `start()` throws `TransportError.cancelled`. (Waycar patch.)
+    private func cancelStartingEngine() async {
+        guard let startingEngine else { return }
+        self.startingEngine = nil
+        await startingEngine.stop()
+    }
+
     private func shutdownRuntime() async {
         receiveTask?.cancel()
         maintenanceTask?.cancel()
         receiveTask = nil
         maintenanceTask = nil
 
+        await cancelStartingEngine() // (Waycar patch)
         if let engine {
             await engine.stop()
         }
@@ -974,6 +1044,7 @@ public actor MoshClientSession {
         receiveTask = nil
         maintenanceTask = nil
 
+        await cancelStartingEngine() // (Waycar patch)
         guard let activeEngine = engine else { return }
         await activeEngine.stop()
         pendingTransportSnapshot = await activeEngine.makeSnapshot()

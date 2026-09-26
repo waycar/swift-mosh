@@ -3,9 +3,11 @@
 - Upstream: <https://github.com/wiedymi/swift-mosh>, tag `v0.1.8`, commit
   `9677768702727ba9094d4936062a452b9c544480`. MIT; `LICENSE` is upstream's,
   unchanged, and ships verbatim as the app's `swift-mosh-MIT.txt` notice.
-- Imported unmodified in `497e131` (`Package.swift`, `LICENSE`, `Sources/`,
-  `Tests/`; upstream's README and scripts are not vendored). Every change
-  since is a Waycar patch, marked `(Waycar patch)` at the site.
+- Imported unmodified in `fd8f98b` (`Package.swift`, `LICENSE`, `Sources/`,
+  `Tests/`; upstream's README and scripts are not vendored). The Waycar patch
+  set is `git diff fd8f98b -- Packages/SwiftMosh`: that diff is authoritative
+  (it also adds this file and `WaycarPatchTests.swift`). Each changed site in
+  `Sources/` carries a `(Waycar patch)` comment to help find it.
 - The app links only the `MoshCore` product.
 
 ## Waycar patches
@@ -26,15 +28,35 @@ mosh-server 1.4.0, without consulting mosh's (GPL) source.
    repeated-but-older state, which could roll the screen back.
 3. **Timestamp replies** (`TransportEngine`). Each outgoing packet echoes the
    peer's latest timestamp once, advanced by how long it was held (under 1 s),
-   so mosh-server can measure round-trip time and pace its frames. Upstream
-   always sent "no reply", which left the server at its slowest frame
-   interval: over the same workload 48 frames instead of ~255, and keystroke
-   echo on localhost at a median of 182 ms instead of 67 ms.
-4. **Debug detail.** The `SWIFTMOSH_DEBUG_REAL_E2E=1` decode log line also
+   so mosh-server can measure round-trip time and pace its frames. A reply
+   that would equal `UInt16.max`, the wire's "no reply", is sent as one less,
+   as outgoing timestamps are. Upstream always sent "no reply", which left the
+   server at its slowest frame interval: over the same workload 48 frames
+   instead of ~255, and keystroke echo on localhost at a median of 182 ms
+   instead of 67 ms.
+4. **Stop during start** (`MoshClientSession`). `start()` waits for its
+   endpoint to connect, which `NetworkDatagramEndpoint` never does while the
+   device is offline or the host name does not resolve. Upstream kept that
+   engine local to `start()`, so `stop()` could not reach it and `start()`
+   never returned. The connecting engine is now held where `stop()` (and a
+   failure, the remote shutdown, or app suspension) stops it; `start()` then
+   throws `MoshSessionError.notStarted` and leaves the state to whatever
+   stopped it, `.stopped` after a `stop()`. A transport restart after a
+   receive error connects the same way and is cancelled the same way.
+   `start()` also refuses to run while a `stop()` is still tearing down,
+   which could otherwise drop the new engine without stopping it.
+5. **Debug detail.** The `SWIFTMOSH_DEBUG_REAL_E2E=1` decode log line also
    prints each instruction's state numbers.
 
-`Tests/SwiftMoshTests/WaycarPatchTests.swift` covers patches 1–3; each case
-fails against upstream v0.1.8.
+`Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
+(final screen applied, maximum state acked, session ends `.stopped` without a
+failure); the prompt re-ack for a state on a base never received and for a
+resent state older than the latest (not applied, re-acked within 1 s against a
+5 s ack interval); the timestamp reply (echoed once, advanced by its hold
+time); and `stop()` ending a `start()` whose endpoint never connects. Each
+case fails against upstream v0.1.8. Not covered: the reply's step off
+`UInt16.max`, cancelling a transport restart, refusing `start()` during a
+stop, and the debug line.
 
 ## Known limitations
 
