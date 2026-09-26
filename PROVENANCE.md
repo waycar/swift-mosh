@@ -47,6 +47,18 @@ mosh-server 1.4.0, without consulting mosh's (GPL) source.
    which could otherwise drop the new engine without stopping it.
 5. **Debug detail.** The `SWIFTMOSH_DEBUG_REAL_E2E=1` decode log line also
    prints each instruction's state numbers.
+6. **Upstream coverage tests removed.** The five `…Coverage` tests in
+   `CoreAndAdapterTests.swift` (`testSessionStartBranchCoverageAndFailureReset`,
+   `testSessionFailureHooksAndClassificationCoverage`,
+   `testSessionCoverageDecodeAndMaintenanceBranches`,
+   `testSessionRttAndReliabilityBranchCoverageHelpers`,
+   `testAckWithoutDirtyStateAndFutureLastSendCoverage`) and the `_test*`
+   hooks in `MoshClientSession` only they called are deleted. They drove
+   private branches through those hooks with synthetic state rather than
+   through the session's lifecycle; the ack, retransmit, heartbeat, and
+   decode tests in the same file cover that logic through the public API.
+   `_testRunReceiveLoopIteration` and `_testPendingOutboundCount` stay, as
+   other tests use them. Re-vendoring must not bring the deleted ones back.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
