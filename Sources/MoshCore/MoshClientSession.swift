@@ -48,6 +48,9 @@ public actor MoshClientSession {
 
     private var lastOutboundAtMs: UInt64 = 0
     private var lastStateSendAtMs: UInt64 = 0
+    /// When this client last sent a new state; drives the heartbeat state.
+    /// (Waycar patch.)
+    private var lastNewStateAtMs: UInt64 = 0
 
     private var ackDirtyAtMs: UInt64?
     private var lastAckSentAtMs: UInt64 = 0
@@ -67,8 +70,17 @@ public actor MoshClientSession {
     /// Set when the server announced shutdown with the maximum state number.
     /// (Waycar patch.)
     private var remoteShutdownReceived = false
+    /// Set when the server acknowledged this client's shutdown state.
+    /// (Waycar patch.)
+    private var localShutdownAcknowledged = false
+    /// The client-initiated shutdown in flight; concurrent callers of
+    /// `shutdown(ackTimeoutMs:)` await it instead of cutting it short.
+    /// (Waycar patch.)
+    private var localShutdownTask: Task<Void, Never>?
     private static let reackSpacingMs: UInt64 = 20
     private static let shutdownAckRepeats = 2
+    private static let shutdownResendIntervalMs: UInt64 = 100
+    private static let shutdownPollIntervalMs: UInt64 = 10
 
     private var consecutiveReceiveFailures: UInt32 = 0
 
@@ -166,6 +178,7 @@ public actor MoshClientSession {
         self.engine = engine
         let now = TransportClock.nowMs()
         lastOutboundAtMs = now
+        lastNewStateAtMs = now // (Waycar patch)
         lastStateSendAtMs = 0
         lastAckSentAtMs = now
         ackDirtyAtMs = latestReceivedStateNum > lastAckReportedNum ? now : nil
@@ -188,6 +201,29 @@ public actor MoshClientSession {
         await shutdownRuntime()
         pendingTransportSnapshot = nil
         state = .stopped
+    }
+
+    /// Ends the session the way mosh's own client quits: sends the shutdown
+    /// state (the maximum state number) until the server acknowledges it or
+    /// `ackTimeoutMs` passes, then stops like `stop()`. mosh-server exits,
+    /// ending its command, once it has acknowledged that state; a plain
+    /// `stop()` leaves it running with its command until its own network
+    /// timeout, if it has one. A session that is not running just stops.
+    /// (Waycar patch.)
+    public func shutdown(ackTimeoutMs: UInt64 = 1_000) async {
+        if let localShutdownTask {
+            await localShutdownTask.value
+            return
+        }
+        guard case .running = state, engine != nil else {
+            await stop()
+            return
+        }
+        localShutdownAcknowledged = false
+        let task = Task { await self.finishLocalShutdown(ackTimeoutMs: ackTimeoutMs) }
+        localShutdownTask = task
+        await task.value
+        localShutdownTask = nil
     }
 
     public func prepareForApplicationBackground() async throws -> MoshSnapshot {
@@ -231,6 +267,15 @@ public actor MoshClientSession {
         try await applySendMinDelayIfNeeded()
 
         let diff = try encodeUserDiff(from: op)
+        try await sendNewState(diff: diff)
+    }
+
+    /// Sends the next client state, built on the last one sent, and tracks
+    /// it for retransmission until the server acknowledges it. (Waycar
+    /// patch) The state is recorded before its send suspends, so a state
+    /// sent meanwhile (the heartbeat, the shutdown) builds on it instead of
+    /// reusing its number; a failed send leaves it to the retransmit queue.
+    private func sendNewState(diff: Data?) async throws {
         let stateNum = lastSentStateNum &+ 1
         let instruction = TransportInstruction(
             protocolVersion: MoshWire.protocolVersion,
@@ -243,8 +288,6 @@ public actor MoshClientSession {
         )
 
         let payload = try encodeInstruction(instruction)
-        try await sendPayload(payload)
-
         let now = TransportClock.nowMs()
         let pending = PendingOutboundInstruction(
             stateNum: stateNum,
@@ -256,6 +299,8 @@ public actor MoshClientSession {
         pendingOutbound[stateNum] = pending
         pendingOutboundOrder.append(stateNum)
         lastSentStateNum = stateNum
+        lastNewStateAtMs = now
+        try await sendPayload(payload)
     }
 
     public func drainHostOps() async -> [MoshHostOp] {
@@ -594,6 +639,11 @@ public actor MoshClientSession {
         }
 
         if let ack = instruction.ackNum {
+            if ack == UInt64.max {
+                // The server acknowledged this client's shutdown state and
+                // is exiting. (Waycar patch.)
+                localShutdownAcknowledged = true
+            }
             acknowledgePendingOutbound(through: ack)
         }
         if let throwaway = instruction.throwawayNum, throwaway > 0 {
@@ -759,6 +809,23 @@ public actor MoshClientSession {
     }
 
     private func maybeSendHeartbeat(nowMs: UInt64) async throws {
+        // (Waycar patch) mosh-server's idle clock, which ends the server
+        // after `MOSH_SERVER_NETWORK_TMOUT`, advances only on a new client
+        // state; a repeated state number does not reset it. So with nothing
+        // left to retransmit, the heartbeat is a new, empty state, as mosh's
+        // own client sends when idle, and it is due by the time since the
+        // last new state: acks for a steady stream of output must not put it
+        // off. Otherwise it repeats the current state, as upstream did.
+        if pendingOutbound.isEmpty, nowMs >= lastNewStateAtMs,
+           nowMs - lastNewStateAtMs >= UInt64(config.heartbeatIntervalMs)
+        {
+            try await sendNewState(diff: nil)
+            lastAckSentAtMs = nowMs
+            lastAckReportedNum = latestReceivedStateNum
+            ackDirtyAtMs = nil
+            reackRequested = false
+            return
+        }
         guard nowMs >= lastOutboundAtMs else { return }
         guard nowMs - lastOutboundAtMs >= UInt64(config.heartbeatIntervalMs) else { return }
 
@@ -824,8 +891,15 @@ public actor MoshClientSession {
         return try MoshCompressionCodec().compress(encodedInstruction, algorithm: .zlib)
     }
 
+    /// The newest state the server has acknowledged: every state before the
+    /// first unacknowledged one was acknowledged. mosh-server discards the
+    /// states below this number and keeps that one as the base for the
+    /// next. (Waycar patch: upstream sent the first unacknowledged state, or
+    /// 0 with none pending, so an idle session's server kept every state
+    /// until its 1024-state queue limit throttled input to one state per
+    /// 15 s, which heartbeat states would reach within an hour.)
     private func computeThrowawayNum() -> UInt64 {
-        pendingOutboundOrder.first ?? 0
+        pendingOutboundOrder.first.map { $0 - 1 } ?? lastSentStateNum
     }
 
     private func currentRtoClampedMs() -> UInt32 {
@@ -932,6 +1006,50 @@ public actor MoshClientSession {
         }
         await shutdownRuntime()
         state = .stopped
+    }
+
+    /// Sends the shutdown state until mosh-server acknowledges it or the
+    /// deadline passes, retransmitting unacknowledged states too, since the
+    /// shutdown state builds on the newest of them. The receive loop keeps
+    /// running meanwhile and records the acknowledgement; the maintenance
+    /// loop has stopped with `.running`. (Waycar patch.)
+    private func finishLocalShutdown(ackTimeoutMs: UInt64) async {
+        state = .stopping
+        let deadline = TransportClock.nowMs() &+ ackTimeoutMs
+        var nextSendAtMs: UInt64 = 0
+        while !localShutdownAcknowledged, engine != nil {
+            let now = TransportClock.nowMs()
+            guard now < deadline else { break }
+            try? await processRetransmitQueue(nowMs: now)
+            if now >= nextSendAtMs {
+                try? await sendShutdownState()
+                nextSendAtMs = now &+ Self.shutdownResendIntervalMs
+            }
+            try? await Task.sleep(nanoseconds: Self.shutdownPollIntervalMs * 1_000_000)
+        }
+        await shutdownRuntime()
+        pendingTransportSnapshot = nil
+        state = .stopped
+    }
+
+    /// The shutdown state: an empty diff on the newest state sent, so it
+    /// carries all of this client's input. Built on an older state, it would
+    /// drop input mosh-server may already have applied, which breaks the
+    /// server's diff of its own input stream. mosh-server drops it until
+    /// that base arrives, hence the retransmissions alongside. (Waycar
+    /// patch.)
+    private func sendShutdownState() async throws {
+        let base = lastSentStateNum
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: base,
+            newNum: UInt64.max,
+            ackNum: latestReceivedStateNum,
+            throwawayNum: computeThrowawayNum(),
+            diff: nil,
+            chaff: Data()
+        )
+        try await sendPayload(try encodeInstruction(instruction))
     }
 
     private enum ReceiveErrorDisposition {

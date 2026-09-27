@@ -182,21 +182,24 @@ final class MoshBootstrapTests: XCTestCase {
         XCTAssertNotNil(info.serverPID)
     }
 
-    func testLaunchLocalServerSuccessInjectsProcessPIDWhileRunning() throws {
+    func testLaunchLocalServerWaitsForTheDetachedServerPID() throws {
+        // mosh-server prints its connect line before forking and the
+        // detached server's pid after; the launcher's own child exits then.
         let key = "ABCDEFGHIJKLMNOPQRSTUV"
         let script = try makeExecutableScript("""
         echo "MOSH CONNECT 62013 \(key)"
-        sleep 1
+        sleep 0.3
+        echo "[mosh-server detached, pid = 4242]"
         """)
         defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
 
         let info = try MoshServerLauncher.launchLocalServer(
-            timeout: 1,
+            timeout: 2,
             environment: ["MOSH_SERVER_BIN": script.path]
         )
         XCTAssertEqual(info.port, 62013)
         XCTAssertEqual(info.key, key)
-        XCTAssertNotNil(info.serverPID)
+        XCTAssertEqual(info.serverPID, 4242, "the pid to stop is the detached server's, not the launcher child's")
     }
 
     func testLaunchLocalServerInvalidKeyWhileRunning() throws {

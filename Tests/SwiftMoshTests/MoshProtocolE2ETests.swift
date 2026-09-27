@@ -474,6 +474,13 @@ final class MoshProtocolE2ETests: XCTestCase {
             throw XCTSkip("Could not parse mosh-server output: \(output)")
         }
 
-        return (port, String(output[keyRange]), proc.processIdentifier)
+        // The detached server's pid, not `proc`'s: that process exits right
+        // after the fork, so signalling it leaves the server running.
+        // (Waycar patch.)
+        let pidRegex = try NSRegularExpression(pattern: #"detached, pid = (\d+)"#)
+        let serverPID = pidRegex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output))
+            .flatMap { Range($0.range(at: 1), in: output) }
+            .flatMap { pid_t(output[$0]) }
+        return (port, String(output[keyRange]), serverPID)
     }
 }

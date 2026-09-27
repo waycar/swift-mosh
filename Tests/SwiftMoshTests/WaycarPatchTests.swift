@@ -161,6 +161,76 @@ final class WaycarPatchTests: XCTestCase {
         await serverEnd.stop()
     }
 
+    func testShutdownBuildsOnTheNewestStateAndEndsOnServerAck() async throws {
+        let (session, server, serverEnd) = try await makeLinkedSession(config: MoshClientConfig())
+        try await session.enqueue(.keystrokes(Data("x".utf8)))
+        _ = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+        try await sendAck(from: server, ackNum: 1)
+        let acked = await waitUntil(within: 1) { await session._testPendingOutboundCount() == 0 }
+        XCTAssertTrue(acked)
+        // Not acknowledged yet; mosh-server may already have applied it.
+        try await session.enqueue(.keystrokes(Data("y".utf8)))
+        _ = try await nextInstruction(from: server, serverEnd) { $0.newNum == 2 }
+
+        let started = TransportClock.nowMs()
+        let shutdown = Task { await session.shutdown(ackTimeoutMs: 5_000) }
+        // A shutdown state on the acked state 1 would drop input the server
+        // applied with state 2; mosh-server cannot diff its input backwards.
+        let request = try await nextInstruction(from: server, serverEnd) { $0.newNum == UInt64.max }
+        XCTAssertEqual(request.oldNum, 2, "the shutdown state must carry all input sent")
+        XCTAssertEqual(request.throwawayNum, 1, "the server must keep the states the shutdown may build on")
+        let resent = try await nextInstruction(from: server, serverEnd) { $0.newNum == 2 }
+        XCTAssertEqual(resent.oldNum, 1, "the base the shutdown needs is still retransmitted")
+        try await sendAck(from: server, ackNum: UInt64.max)
+        await shutdown.value
+
+        XCTAssertLessThan(TransportClock.nowMs() - started, 3_000, "the server's ack ends the shutdown, not the deadline")
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
+        await serverEnd.stop()
+    }
+
+    func testIdleHeartbeatIsANewStateOnTheAcknowledgedBase() async throws {
+        var config = MoshClientConfig()
+        config.heartbeatIntervalMs = 250
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+
+        // mosh-server's network timeout counts from the last new client
+        // state, so an idle client that only repeats its state number gets
+        // cut off however often it sends.
+        let first = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+        XCTAssertEqual(first.oldNum, 0)
+        XCTAssertNil(first.diff, "a heartbeat carries no input")
+        try await sendAck(from: server, ackNum: 1)
+        let second = try await nextInstruction(from: server, serverEnd) { $0.newNum == 2 }
+        XCTAssertEqual(second.oldNum, 1)
+        // Upstream's throwaway of 0 with nothing pending let mosh-server keep
+        // every state until its queue limit throttled input.
+        XCTAssertEqual(second.throwawayNum, 1, "the server may discard states before the acknowledged one")
+
+        await session.stop()
+        await serverEnd.stop()
+    }
+
+    func testShutdownGivesUpOnASilentServerAtItsDeadline() async throws {
+        let (session, server, serverEnd) = try await makeLinkedSession(config: MoshClientConfig())
+        let log = AckLog()
+        let recorder = recordAcks(from: server, into: log)
+
+        let started = TransportClock.nowMs()
+        await session.shutdown(ackTimeoutMs: 300)
+
+        let elapsed = TransportClock.nowMs() - started
+        XCTAssertGreaterThanOrEqual(elapsed, 300, "the shutdown state is resent until the deadline")
+        XCTAssertLessThan(elapsed, 1_000, "an unreachable server must not hold the shutdown")
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
+        let sent = await log.count()
+        XCTAssertGreaterThan(sent, 1, "a lost shutdown state is resent")
+        await serverEnd.stop()
+        await recorder.value
+    }
+
     // MARK: - Helpers
 
     /// Ack numbers the client sent, in arrival order.
@@ -239,6 +309,43 @@ final class WaycarPatchTests: XCTestCase {
             chaff: Data())
         try await server.sendPayload(
             try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib))
+    }
+
+    private func sendAck(from server: TransportEngine, ackNum: UInt64) async throws {
+        let instruction = TransportInstruction(
+            protocolVersion: 2, oldNum: 0, newNum: 0, ackNum: ackNum, throwawayNum: 0,
+            diff: nil, chaff: Data())
+        try await server.sendPayload(
+            try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib))
+    }
+
+    /// The first instruction from the client that `matches`, within 2 s.
+    /// Stops `serverEnd` on timeout, since its receive ignores cancellation.
+    private func nextInstruction(
+        from server: TransportEngine, _ serverEnd: InMemoryDatagramEndpoint,
+        where matches: @escaping @Sendable (TransportInstruction) -> Bool
+    ) async throws -> TransportInstruction {
+        let found = await withTaskGroup(of: TransportInstruction?.self) { group in
+            group.addTask {
+                while let received = try? await server.receivePayload() {
+                    guard
+                        let plain = try? MoshCompressionCodec().decompress(received.payload, algorithm: .zlib),
+                        let instruction = try? TransportInstruction(decoding: plain)
+                    else { continue }
+                    if matches(instruction) { return instruction }
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if !Task.isCancelled { await serverEnd.stop() }
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        return try XCTUnwrap(found, "the client sent no matching instruction within 2 s")
     }
 
     /// Records the ack number of every instruction the client sends, until

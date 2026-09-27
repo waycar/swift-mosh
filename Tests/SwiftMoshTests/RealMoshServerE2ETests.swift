@@ -120,6 +120,91 @@ final class RealMoshServerE2ETests: XCTestCase {
         }
     }
 
+    /// A plain `stop()` leaves mosh-server and its command running; the
+    /// client-initiated shutdown must end both. (Waycar patch.)
+    func testRealMoshServerAndItsCommandExitAfterGracefulShutdown() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
+            throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
+        }
+
+        let host = env["SWIFTMOSH_REAL_E2E_HOST"] ?? "127.0.0.1"
+        let connect = try Self.launchLocalMoshServer(environment: env)
+        let serverPID = try XCTUnwrap(connect.serverPID, "mosh-server did not report its detached pid")
+        var commandPID: pid_t?
+        defer {
+            for pid in [serverPID, commandPID].compactMap({ $0 }) where Self.isAlive(pid) {
+                _ = kill(pid, SIGKILL)
+            }
+        }
+
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(host: host, port: connect.port, keyBase64_22: connect.key),
+            config: MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
+        )
+        try await session.start()
+        let marker = "__SWIFTMOSH_SHUTDOWN__"
+        try await session.enqueue(.keystrokes(Data((marker + "\n").utf8)))
+        _ = try await waitForHostBytes(
+            session: session, containing: marker, timeoutSeconds: 3, throwOnTimeout: true)
+        // The echo proves the command is up.
+        commandPID = Self.childPID(of: serverPID)
+        let command = try XCTUnwrap(commandPID, "mosh-server has no command process")
+
+        await session.shutdown()
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, Self.isAlive(serverPID) || Self.isAlive(command) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertFalse(Self.isAlive(serverPID), "mosh-server must exit once it acknowledges the shutdown")
+        XCTAssertFalse(Self.isAlive(command), "the server's command must exit with it")
+    }
+
+    /// mosh-server's `MOSH_SERVER_NETWORK_TMOUT` counts from the client's
+    /// last new state; an idle client's heartbeats must reset it, or the
+    /// server cuts off a session nobody is typing into. (Waycar patch.)
+    func testRealMoshServerKeepsAnIdleSessionPastItsNetworkTimeout() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
+            throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
+        }
+
+        let host = env["SWIFTMOSH_REAL_E2E_HOST"] ?? "127.0.0.1"
+        setenv("MOSH_SERVER_NETWORK_TMOUT", "5", 1)
+        let launched = Result { try Self.launchLocalMoshServer(environment: env) }
+        unsetenv("MOSH_SERVER_NETWORK_TMOUT")
+        let connect = try launched.get()
+        let serverPID = try XCTUnwrap(connect.serverPID, "mosh-server did not report its detached pid")
+        defer {
+            if Self.isAlive(serverPID) { _ = kill(serverPID, SIGKILL) }
+        }
+
+        var config = MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
+        config.heartbeatIntervalMs = 500
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(host: host, port: connect.port, keyBase64_22: connect.key),
+            config: config
+        )
+        try await session.start()
+        try await session.enqueue(.keystrokes(Data("__SWIFTMOSH_IDLE_1__\n".utf8)))
+        _ = try await waitForHostBytes(
+            session: session, containing: "__SWIFTMOSH_IDLE_1__", timeoutSeconds: 3, throwOnTimeout: true)
+
+        // Over two network timeouts with no input. mosh-server acks an
+        // empty state only on its 3 s ack interval, and the next heartbeat
+        // state waits for that ack, so new states can be ~3 s apart.
+        try await Task.sleep(nanoseconds: 11_000_000_000)
+        XCTAssertTrue(Self.isAlive(serverPID), "an idle but connected client must keep mosh-server running")
+        try await session.enqueue(.keystrokes(Data("__SWIFTMOSH_IDLE_2__\n".utf8)))
+        _ = try await waitForHostBytes(
+            session: session, containing: "__SWIFTMOSH_IDLE_2__", timeoutSeconds: 3, throwOnTimeout: true)
+
+        await session.shutdown()
+    }
+
     private func waitForHostBytes(
         session: MoshClientSession,
         containing needle: String,
@@ -175,6 +260,23 @@ final class RealMoshServerE2ETests: XCTestCase {
 
     private static func terminateServerProcess(pid: pid_t) {
         _ = kill(pid, SIGTERM)
+    }
+
+    private static func isAlive(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0
+    }
+
+    /// The first child of `pid` (mosh-server's command), via `pgrep -P`.
+    private static func childPID(of pid: pid_t) -> pid_t? {
+        let pipe = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-P", String(pid)]
+        process.standardOutput = pipe
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return output.split(separator: "\n").first.flatMap { pid_t($0) }
     }
 
 }

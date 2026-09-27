@@ -54,7 +54,9 @@ public enum MoshServerLauncher {
         process.standardError = combinedPipe
         combinedPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            if !data.isEmpty {
+            if data.isEmpty {
+                collector.finish()
+            } else {
                 collector.append(data)
             }
         }
@@ -72,9 +74,14 @@ public enum MoshServerLauncher {
 
         let deadline = Date().addingTimeInterval(max(0.05, timeout))
         while Date() < deadline {
-            let output = collector.outputString
-
             if !process.isRunning {
+                // (Waycar patch) The handler may still be delivering the
+                // last lines, mosh-server's pid among them, after the exit.
+                guard collector.reachedEnd else {
+                    Thread.sleep(forTimeInterval: 0.02)
+                    continue
+                }
+                let output = collector.outputString
                 if var parsed = try? MoshServerOutputParser.parse(output) {
                     if parsed.serverPID == nil {
                         parsed = MoshServerConnectInfo(
@@ -98,18 +105,18 @@ public enum MoshServerLauncher {
 
                 throw MoshBootstrapError.processExited
             }
-
+            let output = collector.outputString
             do {
-                var parsed = try MoshServerOutputParser.parse(output)
-                if parsed.serverPID == nil {
-                    parsed = MoshServerConnectInfo(
-                        port: parsed.port,
-                        key: parsed.key,
-                        serverPID: Int32(process.processIdentifier),
-                        rawOutput: output
-                    )
+                // (Waycar patch) mosh-server prints `MOSH CONNECT` before it
+                // forks and its `detached, pid = N` line after. Until that
+                // line arrives the only pid known is the launcher's own
+                // child, which exits right after the fork; returning it left
+                // the detached server unkillable. Keep polling; the branch
+                // above parses the complete output once that child exits.
+                let parsed = try MoshServerOutputParser.parse(output)
+                if parsed.serverPID != nil {
+                    return parsed
                 }
-                return parsed
             } catch let error as MoshBootstrapError where error == .invalidConnectLine {
                 // Keep polling while process is still producing output.
             } catch let error as MoshBootstrapError where
@@ -197,6 +204,7 @@ public enum MoshServerLauncher {
 private final class OutputCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
+    private var ended = false
 
     var outputString: String {
         lock.lock()
@@ -204,9 +212,23 @@ private final class OutputCollector: @unchecked Sendable {
         return String(decoding: buffer, as: UTF8.self)
     }
 
+    /// Whether the pipe reached end of file, so `outputString` is complete.
+    /// (Waycar patch.)
+    var reachedEnd: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ended
+    }
+
     func append(_ data: Data) {
         lock.lock()
         buffer.append(data)
+        lock.unlock()
+    }
+
+    func finish() {
+        lock.lock()
+        ended = true
         lock.unlock()
     }
 }
