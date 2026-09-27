@@ -82,15 +82,10 @@ public enum MoshServerLauncher {
                     continue
                 }
                 let output = collector.outputString
-                if var parsed = try? MoshServerOutputParser.parse(output) {
-                    if parsed.serverPID == nil {
-                        parsed = MoshServerConnectInfo(
-                            port: parsed.port,
-                            key: parsed.key,
-                            serverPID: Int32(process.processIdentifier),
-                            rawOutput: output
-                        )
-                    }
+                // (Waycar patch) No pid line means no pid: the launcher's
+                // own child has been reaped, and its recycled pid could name
+                // an unrelated process. Upstream returned it.
+                if let parsed = try? MoshServerOutputParser.parse(output) {
                     return parsed
                 }
 
@@ -108,11 +103,11 @@ public enum MoshServerLauncher {
             let output = collector.outputString
             do {
                 // (Waycar patch) mosh-server prints `MOSH CONNECT` before it
-                // forks and its `detached, pid = N` line after. Until that
-                // line arrives the only pid known is the launcher's own
-                // child, which exits right after the fork; returning it left
-                // the detached server unkillable. Keep polling; the branch
-                // above parses the complete output once that child exits.
+                // forks and its `detached, pid = N` line after. Keep polling
+                // for that line; upstream returned the launcher's own child's
+                // pid here, which exits right after the fork and left the
+                // detached server unkillable. The branch above parses the
+                // complete output once that child exits.
                 let parsed = try MoshServerOutputParser.parse(output)
                 if parsed.serverPID != nil {
                     return parsed

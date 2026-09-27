@@ -481,6 +481,7 @@ final class MoshProtocolE2ETests: XCTestCase {
         let serverPID = pidRegex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output))
             .flatMap { Range($0.range(at: 1), in: output) }
             .flatMap { pid_t(output[$0]) }
+            .flatMap { $0 > 1 ? $0 : nil }
         return (port, String(output[keyRange]), serverPID)
     }
 }

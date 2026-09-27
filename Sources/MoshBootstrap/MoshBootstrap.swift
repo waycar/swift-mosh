@@ -104,7 +104,8 @@ public enum MoshServerOutputParser {
         let range = NSRange(output.startIndex..<output.endIndex, in: output)
         guard let match = pidRegex.firstMatch(in: output, options: [], range: range),
               let pidRange = Range(match.range(at: 1), in: output),
-              let pid = Int32(output[pidRange])
+              let pid = Int32(output[pidRange]),
+              pid > 1 // (Waycar patch) 0 and 1 name no server process to signal.
         else {
             return nil
         }

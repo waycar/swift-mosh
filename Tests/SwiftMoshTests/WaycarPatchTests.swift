@@ -231,14 +231,94 @@ final class WaycarPatchTests: XCTestCase {
         await recorder.value
     }
 
+    func testAnAckArrivingDuringARetransmitIsNotUndone() async throws {
+        var config = MoshClientConfig()
+        config.initialRtoMs = 50
+        config.maxRtoMs = 50
+        config.heartbeatIntervalMs = 250
+        let (session, server, serverEnd, client) = try await makeHeldSendSession(config: config)
+        try await session.enqueue(.keystrokes(Data("x".utf8)))
+        _ = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+
+        // Hold state 1's retransmission, as a send whose completion is
+        // slow, and acknowledge the state meanwhile.
+        await client.holdSends()
+        let holding = await waitUntil(within: 1) { await client.heldSendCount > 0 }
+        XCTAssertTrue(holding)
+        try await sendAck(from: server, ackNum: 1)
+        let acked = await waitUntil(within: 1) { await session._testPendingOutboundCount() == 0 }
+        XCTAssertTrue(acked)
+        await client.releaseSends()
+
+        // The retransmission used to write state 1 back once its send
+        // returned, where no later ack could reach it; the idle heartbeat
+        // then never sent a new state again and mosh-server's network
+        // timeout ended the session.
+        let heartbeat = try await nextInstruction(from: server, serverEnd) { $0.newNum == 2 }
+        XCTAssertEqual(heartbeat.oldNum, 1)
+        let pending = await session._testPendingOutboundCount()
+        XCTAssertEqual(pending, 1, "only the heartbeat state may be unacknowledged; state 1 was acked")
+
+        await session.stop()
+        await serverEnd.stop()
+    }
+
+    func testShutdownEndsAtItsDeadlineWhileASendNeverCompletes() async throws {
+        let (session, _, serverEnd, client) = try await makeHeldSendSession(config: MoshClientConfig())
+        // Like an NWConnection whose path is not ready: no send completes
+        // until the connection is cancelled.
+        await client.holdSends()
+
+        let started = TransportClock.nowMs()
+        let (finished, finish) = AsyncStream<Void>.makeStream()
+        Task {
+            await session.shutdown(ackTimeoutMs: 300)
+            finish.finish()
+        }
+        let returned = await finishes(finished, within: 3)
+
+        XCTAssertTrue(returned, "a send that never completes must not hold the shutdown past its deadline")
+        XCTAssertLessThan(TransportClock.nowMs() - started, 1_500)
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
+        await client.stop()
+        await serverEnd.stop()
+    }
+
+    func testInputPacedPastTheStartOfAShutdownIsNotSent() async throws {
+        var config = MoshClientConfig()
+        config.sendMinDelayMs = 1_000
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        let log = AckLog()
+        let recorder = recordAcks(from: server, into: log)
+        try await session.enqueue(.keystrokes(Data("a".utf8)))
+
+        // The second input waits out the pacing delay; the shutdown starts
+        // meanwhile and is still waiting for its ack when that delay ends.
+        let paced = Task { try await session.enqueue(.keystrokes(Data("b".utf8))) }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let shutdown = Task { await session.shutdown(ackTimeoutMs: 2_000) }
+        let result = await paced.result
+        await shutdown.value
+
+        XCTAssertThrowsError(try result.get(), "input after the shutdown began must be refused")
+        let newNums = await log.newNums()
+        XCTAssertTrue(newNums.contains(UInt64.max))
+        XCTAssertFalse(newNums.contains(2), "no client state may follow the shutdown state")
+        await serverEnd.stop()
+        await recorder.value
+    }
+
     // MARK: - Helpers
 
-    /// Ack numbers the client sent, in arrival order.
+    /// Ack and new state numbers the client sent, in arrival order.
     private actor AckLog {
         private var entries: [UInt64] = []
+        private var newStateNums: [UInt64] = []
 
-        func record(_ ackNum: UInt64) {
-            entries.append(ackNum)
+        func record(_ instruction: TransportInstruction) {
+            if let ackNum = instruction.ackNum { entries.append(ackNum) }
+            if let newNum = instruction.newNum { newStateNums.append(newNum) }
         }
 
         func count() -> Int {
@@ -248,6 +328,63 @@ final class WaycarPatchTests: XCTestCase {
         /// Ack numbers recorded after the first `index` entries.
         func acks(after index: Int) -> [UInt64] {
             Array(entries.dropFirst(index))
+        }
+
+        func newNums() -> [UInt64] {
+            newStateNums
+        }
+    }
+
+    /// The client's in-memory endpoint with sends a test can hold, like an
+    /// NWConnection whose send completion has not fired. `stop()` fails the
+    /// held sends, as cancelling that connection does.
+    private actor HeldSendDatagramEndpoint: DatagramEndpoint {
+        private let inner: InMemoryDatagramEndpoint
+        private var holding = false
+        private var held: [CheckedContinuation<Void, Error>] = []
+
+        init(inner: InMemoryDatagramEndpoint) {
+            self.inner = inner
+        }
+
+        var heldSendCount: Int {
+            held.count
+        }
+
+        func holdSends() {
+            holding = true
+        }
+
+        func releaseSends() {
+            holding = false
+            let released = held
+            held.removeAll()
+            for continuation in released { continuation.resume() }
+        }
+
+        func start() async throws {
+            try await inner.start()
+        }
+
+        func stop() async {
+            holding = false
+            let cancelled = held
+            held.removeAll()
+            for continuation in cancelled { continuation.resume(throwing: TransportError.cancelled) }
+            await inner.stop()
+        }
+
+        func send(_ data: Data) async throws {
+            if holding {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    held.append(continuation)
+                }
+            }
+            try await inner.send(data)
+        }
+
+        func receive() async throws -> TransportDatagram {
+            try await inner.receive()
         }
     }
 
@@ -284,14 +421,22 @@ final class WaycarPatchTests: XCTestCase {
     private func makeLinkedSession(
         config: MoshClientConfig
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint) {
+        let (session, server, serverEnd, _) = try await makeHeldSendSession(config: config)
+        return (session, server, serverEnd)
+    }
+
+    private func makeHeldSendSession(
+        config: MoshClientConfig
+    ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint, HeldSendDatagramEndpoint) {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
+        let client = HeldSendDatagramEndpoint(inner: clientEnd)
         let key = Data(repeating: 0x42, count: 16)
         let session = MoshClientSession(
             endpoint: MoshEndpoint(
                 host: "127.0.0.1", port: 60001,
                 keyBase64_22: try MoshBase64Key(raw: key).printable),
             config: config,
-            endpointFactory: { _, _ in clientEnd },
+            endpointFactory: { _, _ in client },
             snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
         )
         try await session.start()
@@ -299,7 +444,7 @@ final class WaycarPatchTests: XCTestCase {
         let server = TransportEngine(
             endpoint: serverEnd, outgoingDirection: .toClient,
             cipher: try OCBTransportCipher(key: key))
-        return (session, server, serverEnd)
+        return (session, server, serverEnd, client)
     }
 
     private func sendState(from server: TransportEngine, old: UInt64, new: UInt64, text: String) async throws {
@@ -348,18 +493,34 @@ final class WaycarPatchTests: XCTestCase {
         return try XCTUnwrap(found, "the client sent no matching instruction within 2 s")
     }
 
-    /// Records the ack number of every instruction the client sends, until
-    /// the server endpoint stops.
+    /// Records every instruction the client sends, until the server
+    /// endpoint stops.
     private func recordAcks(from server: TransportEngine, into log: AckLog) -> Task<Void, Never> {
         Task {
             while let received = try? await server.receivePayload() {
                 guard
                     let plain = try? MoshCompressionCodec().decompress(received.payload, algorithm: .zlib),
-                    let instruction = try? TransportInstruction(decoding: plain),
-                    let ackNum = instruction.ackNum
+                    let instruction = try? TransportInstruction(decoding: plain)
                 else { continue }
-                await log.record(ackNum)
+                await log.record(instruction)
             }
+        }
+    }
+
+    /// Whether `stream` finishes within `seconds`.
+    private func finishes(_ stream: AsyncStream<Void>, within seconds: Double) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in stream {}
+                return !Task.isCancelled
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
         }
     }
 

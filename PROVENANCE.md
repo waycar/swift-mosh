@@ -75,8 +75,11 @@ taken.
    may already have applied, which mosh-server cannot diff (an assertion, or
    an out-of-bounds read with asserts compiled out). mosh-server ignores it
    until that base arrives, so unacknowledged states keep being retransmitted
-   meanwhile. Concurrent callers share one shutdown; a session that is not
-   running just stops.
+   meanwhile. The deadline holds even when a send never completes
+   (NWConnection completes none while its path is not ready): at the
+   deadline the runtime stops, cancelling the connection, which fails that
+   send. Concurrent callers share one shutdown; a session that is not running
+   just stops.
 8. **Idle heartbeat is a new state; throwaway is the acknowledged state**
    (`MoshClientSession`). mosh-server's `MOSH_SERVER_NETWORK_TMOUT` counts
    from the client's last *new* state; a repeated state number does not reset
@@ -91,9 +94,17 @@ taken.
    limit starts refusing new ones for 15 s at a time; heartbeat states alone
    would reach that within an hour. A new state is also recorded before its
    send suspends, so a heartbeat or shutdown state sent meanwhile builds on
-   it rather than reusing its number (which would have lost the input); a
-   failed send now leaves the state to the retransmit queue instead of
-   dropping it.
+   it rather than reusing its number (which would have lost the input).
+   Delivery then belongs to the retransmit queue: `enqueue` throws only when
+   the session is not running (checked again after the pacing delay, so no
+   input follows a shutdown state), not when the first send fails, and input
+   typed during a transport swap is retransmitted instead of dropped. The
+   retransmit queue updates a state's entry before its send suspends too:
+   upstream wrote it back afterwards, reviving a state acknowledged during
+   the send where no later ack could remove it, which stopped the idle
+   heartbeat's new states for good (4 of 6 idle sessions against a real
+   mosh-server within 5 minutes). The heartbeat checks
+   `pendingOutboundOrder`, the list acks prune.
 9. **Detached server pid** (`MoshServerLauncher.launchLocalServer`, tests
    only). mosh-server prints `MOSH CONNECT` before it forks and
    `[mosh-server detached, pid = N]` after; the launcher returned as soon as
@@ -101,8 +112,9 @@ taken.
    fork. The tests' SIGTERM then missed the detached server and left it (and
    its `cat`) running: one such server had been alive almost two days. The
    launcher now waits for the pid line, reading the pipe to its end once that
-   child exits, and `MoshProtocolE2ETests`' own launcher parses the line
-   instead of returning its child's pid.
+   child exits, and returns no pid without it; `MoshProtocolE2ETests`' own
+   launcher parses the line instead of returning its child's pid. A pid of 0
+   or 1 is not a server's and is ignored.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
@@ -111,15 +123,18 @@ resent state older than the latest (not applied, re-acked within 1 s against a
 5 s ack interval); the timestamp reply (echoed once, advanced by its hold
 time); `stop()` ending a `start()` whose endpoint never connects; the client
 shutdown (built on the newest state with that state still retransmitted,
-ended by the server's ack well before its deadline, and ended at the deadline
-by a silent server); and the idle heartbeat (a new empty state whose
-throwaway is the acknowledged state). Each case fails against upstream
-v0.1.8. The real-server suite proves the client shutdown end to end
-(mosh-server and its command both exit; it fails with `stop()` in its place)
-and an idle session outliving three `MOSH_SERVER_NETWORK_TMOUT` periods.
-`MoshBootstrapTests` covers the launcher waiting for the detached pid. Not
-covered: the reply's step off `UInt16.max`, cancelling a transport restart,
-refusing `start()` during a stop, and the debug line.
+ended by the server's ack well before its deadline, ended at the deadline by
+a silent server and by a send that never completes, and refusing input paced
+past its start); the idle heartbeat (a new empty state whose throwaway is the
+acknowledged state); and an ack that arrives while that state's
+retransmission is being sent. Each case fails against upstream v0.1.8. The
+real-server suite proves the client shutdown end to end (mosh-server and its
+command both exit; it fails with `stop()` in its place) and an idle session
+outliving two `MOSH_SERVER_NETWORK_TMOUT` periods. `MoshBootstrapTests`
+covers the launcher waiting for the detached pid, reporting none without it,
+and ignoring pids 0 and 1. Not covered: the reply's step off `UInt16.max`,
+cancelling a transport restart, refusing `start()` during a stop, and the
+debug line.
 
 ## Known limitations
 

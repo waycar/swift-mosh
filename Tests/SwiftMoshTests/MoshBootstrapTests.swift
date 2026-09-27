@@ -19,6 +19,15 @@ final class MoshBootstrapTests: XCTestCase {
         XCTAssertEqual(info.serverPID, 4242)
     }
 
+    func testParseIgnoresAPIDThatNamesNoServer() throws {
+        // Signalling pid 0 hits the caller's process group, pid 1 launchd.
+        let key = "ABCDEFGHIJKLMNOPQRSTUV"
+        for pid in ["0", "1"] {
+            let info = try MoshServerOutputParser.parse("MOSH CONNECT 60001 \(key)\n[mosh-server detached, pid = \(pid)]")
+            XCTAssertNil(info.serverPID, "pid \(pid)")
+        }
+    }
+
     func testParseSkipsMalformedConnectBeforeValidLine() throws {
         let key = "ABCDEFGHIJKLMNOPQRSTUV"
         let output = """
@@ -166,7 +175,7 @@ final class MoshBootstrapTests: XCTestCase {
         XCTAssertTrue(info.rawOutput.contains("MOSH CONNECT 62000 \(key)"))
     }
 
-    func testLaunchLocalServerSuccessInjectsProcessPIDWhenMissing() throws {
+    func testLaunchLocalServerReportsNoPIDWithoutTheDetachedLine() throws {
         let key = "ABCDEFGHIJKLMNOPQRSTUV"
         let script = try makeExecutableScript("""
         echo "MOSH CONNECT 62010 \(key)"
@@ -179,7 +188,8 @@ final class MoshBootstrapTests: XCTestCase {
         )
         XCTAssertEqual(info.port, 62010)
         XCTAssertEqual(info.key, key)
-        XCTAssertNotNil(info.serverPID)
+        // The launcher's exited child is no server, and its pid may be reused.
+        XCTAssertNil(info.serverPID)
     }
 
     func testLaunchLocalServerWaitsForTheDetachedServerPID() throws {

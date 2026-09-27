@@ -256,25 +256,38 @@ public actor MoshClientSession {
         }
     }
 
+    /// Queues a keystroke or resize as the next client state. Throws, and
+    /// drops the op, when the session is not running, including once a
+    /// `shutdown()` or `stop()` has begun. Once accepted, the op is delivered
+    /// by retransmission even if its first send fails, for instance while
+    /// the transport is being replaced after a network change. (Waycar patch:
+    /// upstream threw on a failed first send, and could send after a stop
+    /// began during the pacing delay.)
     public func enqueue(_ op: MoshClientOp) async throws {
+        try requireRunning()
+        try await applySendMinDelayIfNeeded()
+        try requireRunning() // (Waycar patch)
+
+        let diff = try encodeUserDiff(from: op)
+        try await sendNewState(diff: diff)
+    }
+
+    private func requireRunning() throws {
         guard case .running = state else {
             if case .failed(let reason) = state {
                 throw MoshSessionError.sessionFailed(reason)
             }
             throw MoshSessionError.notStarted
         }
-
-        try await applySendMinDelayIfNeeded()
-
-        let diff = try encodeUserDiff(from: op)
-        try await sendNewState(diff: diff)
     }
 
-    /// Sends the next client state, built on the last one sent, and tracks
-    /// it for retransmission until the server acknowledges it. (Waycar
-    /// patch) The state is recorded before its send suspends, so a state
-    /// sent meanwhile (the heartbeat, the shutdown) builds on it instead of
-    /// reusing its number; a failed send leaves it to the retransmit queue.
+    /// Records the next client state, built on the last one sent, for
+    /// retransmission until the server acknowledges it, then sends it.
+    /// (Waycar patch) The state is recorded before the send suspends, so a
+    /// state sent meanwhile (the heartbeat, the shutdown) builds on this one
+    /// instead of reusing its number. Delivery then belongs to the retransmit
+    /// queue: a failed first send is retried with the state, and a lasting
+    /// failure surfaces there.
     private func sendNewState(diff: Data?) async throws {
         let stateNum = lastSentStateNum &+ 1
         let instruction = TransportInstruction(
@@ -300,7 +313,7 @@ public actor MoshClientSession {
         pendingOutboundOrder.append(stateNum)
         lastSentStateNum = stateNum
         lastNewStateAtMs = now
-        try await sendPayload(payload)
+        try? await sendPayload(payload)
     }
 
     public func drainHostOps() async -> [MoshHostOp] {
@@ -774,13 +787,17 @@ public actor MoshClientSession {
             guard var pending = pendingOutbound[stateNum] else { continue }
             guard nowMs >= pending.nextRetryAtMs else { continue }
 
-            try await sendPayload(pending.payload)
             if pending.retryCount < config.maxRetransmitCount {
                 pending.retryCount += 1
             }
             pending.lastSentAtMs = nowMs
             pending.nextRetryAtMs = nowMs &+ UInt64(currentRtoClampedMs())
+            // (Waycar patch) Updated before the send suspends: an ack handled
+            // during it removes the state for good. Upstream wrote the entry
+            // back after the send, reviving an acked state that no later ack
+            // could remove (acks walk `pendingOutboundOrder`).
             pendingOutbound[stateNum] = pending
+            try await sendPayload(pending.payload)
         }
     }
 
@@ -815,8 +832,9 @@ public actor MoshClientSession {
         // left to retransmit, the heartbeat is a new, empty state, as mosh's
         // own client sends when idle, and it is due by the time since the
         // last new state: acks for a steady stream of output must not put it
-        // off. Otherwise it repeats the current state, as upstream did.
-        if pendingOutbound.isEmpty, nowMs >= lastNewStateAtMs,
+        // off. Otherwise it repeats the current state, as upstream did. Only
+        // while running: a shutdown builds on the newest state.
+        if state == .running, pendingOutboundOrder.isEmpty, nowMs >= lastNewStateAtMs,
            nowMs - lastNewStateAtMs >= UInt64(config.heartbeatIntervalMs)
         {
             try await sendNewState(diff: nil)
@@ -1009,17 +1027,34 @@ public actor MoshClientSession {
     }
 
     /// Sends the shutdown state until mosh-server acknowledges it or the
-    /// deadline passes, retransmitting unacknowledged states too, since the
-    /// shutdown state builds on the newest of them. The receive loop keeps
+    /// deadline passes, then stops the runtime. The receive loop keeps
     /// running meanwhile and records the acknowledgement; the maintenance
-    /// loop has stopped with `.running`. (Waycar patch.)
+    /// loop has stopped with `.running`. A send can wait forever
+    /// (NWConnection completes none while its path is not ready), so the
+    /// deadline does not wait on the handshake: stopping the runtime cancels
+    /// the connection, which fails a send still waiting. (Waycar patch.)
     private func finishLocalShutdown(ackTimeoutMs: UInt64) async {
         state = .stopping
         let deadline = TransportClock.nowMs() &+ ackTimeoutMs
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.sendShutdownUntilAcknowledged(deadline: deadline) }
+            group.addTask { try? await Task.sleep(nanoseconds: ackTimeoutMs * 1_000_000) }
+            await group.next()
+            group.cancelAll()
+            await self.shutdownRuntime()
+        }
+        pendingTransportSnapshot = nil
+        state = .stopped
+    }
+
+    /// Resends the shutdown state, and retransmits unacknowledged states
+    /// since it builds on the newest of them, until acknowledged, the
+    /// deadline, or the runtime stops. (Waycar patch.)
+    private func sendShutdownUntilAcknowledged(deadline: UInt64) async {
         var nextSendAtMs: UInt64 = 0
-        while !localShutdownAcknowledged, engine != nil {
+        while !localShutdownAcknowledged, engine != nil, !Task.isCancelled {
             let now = TransportClock.nowMs()
-            guard now < deadline else { break }
+            guard now < deadline else { return }
             try? await processRetransmitQueue(nowMs: now)
             if now >= nextSendAtMs {
                 try? await sendShutdownState()
@@ -1027,9 +1062,6 @@ public actor MoshClientSession {
             }
             try? await Task.sleep(nanoseconds: Self.shutdownPollIntervalMs * 1_000_000)
         }
-        await shutdownRuntime()
-        pendingTransportSnapshot = nil
-        state = .stopped
     }
 
     /// The shutdown state: an empty diff on the newest state sent, so it
