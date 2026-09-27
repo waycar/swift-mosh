@@ -285,9 +285,11 @@ public actor MoshClientSession {
     /// retransmission until the server acknowledges it, then sends it.
     /// (Waycar patch) The state is recorded before the send suspends, so a
     /// state sent meanwhile (the heartbeat, the shutdown) builds on this one
-    /// instead of reusing its number. Delivery then belongs to the retransmit
-    /// queue: a failed first send is retried with the state, and a lasting
-    /// failure surfaces there.
+    /// instead of reusing its number. Its first retry is timed from the end
+    /// of that send, as upstream timed it, so a slow send is not
+    /// retransmitted while it is still going out. Delivery then belongs to
+    /// the retransmit queue: a failed first send is retried with the state,
+    /// and a lasting failure surfaces there.
     private func sendNewState(diff: Data?) async throws {
         let stateNum = lastSentStateNum &+ 1
         let instruction = TransportInstruction(
@@ -307,13 +309,17 @@ public actor MoshClientSession {
             payload: payload,
             retryCount: 0,
             lastSentAtMs: now,
-            nextRetryAtMs: now &+ UInt64(currentRtoClampedMs())
+            nextRetryAtMs: UInt64.max
         )
         pendingOutbound[stateNum] = pending
         pendingOutboundOrder.append(stateNum)
         lastSentStateNum = stateNum
         lastNewStateAtMs = now
         try? await sendPayload(payload)
+        // Optional chaining: a state acknowledged during the send stays gone.
+        let sentAt = TransportClock.nowMs()
+        pendingOutbound[stateNum]?.lastSentAtMs = sentAt
+        pendingOutbound[stateNum]?.nextRetryAtMs = sentAt &+ UInt64(currentRtoClampedMs())
     }
 
     public func drainHostOps() async -> [MoshHostOp] {

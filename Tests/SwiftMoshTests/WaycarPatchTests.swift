@@ -263,6 +263,27 @@ final class WaycarPatchTests: XCTestCase {
         await serverEnd.stop()
     }
 
+    func testANewStateIsNotRetransmittedWhileItsFirstSendIsGoingOut() async throws {
+        var config = MoshClientConfig()
+        config.initialRtoMs = 50
+        config.maxRtoMs = 50
+        let (session, _, serverEnd, client) = try await makeHeldSendSession(config: config)
+        await client.holdSends()
+
+        let enqueued = Task { try await session.enqueue(.keystrokes(Data("x".utf8))) }
+        let holding = await waitUntil(within: 1) { await client.heldSendCount == 1 }
+        XCTAssertTrue(holding)
+        // Four retransmission timeouts pass while the first send is out.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let sends = await client.heldSendCount
+        XCTAssertEqual(sends, 1, "the retry is timed from the end of the first send, as upstream timed it")
+
+        await client.releaseSends()
+        try await enqueued.value
+        await session.stop()
+        await serverEnd.stop()
+    }
+
     func testShutdownEndsAtItsDeadlineWhileASendNeverCompletes() async throws {
         let (session, _, serverEnd, client) = try await makeHeldSendSession(config: MoshClientConfig())
         // Like an NWConnection whose path is not ready: no send completes
