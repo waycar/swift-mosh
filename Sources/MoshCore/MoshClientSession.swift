@@ -1035,10 +1035,12 @@ public actor MoshClientSession {
     /// the connection, which fails a send still waiting. (Waycar patch.)
     private func finishLocalShutdown(ackTimeoutMs: UInt64) async {
         state = .stopping
-        let deadline = TransportClock.nowMs() &+ ackTimeoutMs
+        // Clamped so the nanosecond conversion cannot overflow.
+        let timeoutMs = min(ackTimeoutMs, UInt64.max / 1_000_000)
+        let deadline = TransportClock.nowMs() &+ timeoutMs
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.sendShutdownUntilAcknowledged(deadline: deadline) }
-            group.addTask { try? await Task.sleep(nanoseconds: ackTimeoutMs * 1_000_000) }
+            group.addTask { try? await Task.sleep(nanoseconds: timeoutMs * 1_000_000) }
             await group.next()
             group.cancelAll()
             await self.shutdownRuntime()
