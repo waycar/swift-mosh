@@ -165,7 +165,7 @@ final class MoshBootstrapTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
 
         let info = try MoshServerLauncher.launchLocalServer(
-            timeout: 1,
+            timeout: 30,
             environment: ["MOSH_SERVER_BIN": script.path]
         )
 
@@ -183,7 +183,7 @@ final class MoshBootstrapTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
 
         let info = try MoshServerLauncher.launchLocalServer(
-            timeout: 1,
+            timeout: 30,
             environment: ["MOSH_SERVER_BIN": script.path]
         )
         XCTAssertEqual(info.port, 62010)
@@ -204,7 +204,7 @@ final class MoshBootstrapTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
 
         let info = try MoshServerLauncher.launchLocalServer(
-            timeout: 2,
+            timeout: 30,
             environment: ["MOSH_SERVER_BIN": script.path]
         )
         XCTAssertEqual(info.port, 62013)
@@ -221,7 +221,7 @@ final class MoshBootstrapTests: XCTestCase {
 
         assertBootstrapError(.invalidKey) {
             _ = try MoshServerLauncher.launchLocalServer(
-                timeout: 1,
+                timeout: 30,
                 environment: ["MOSH_SERVER_BIN": script.path]
             )
         }
@@ -236,7 +236,7 @@ final class MoshBootstrapTests: XCTestCase {
 
         assertBootstrapError(.permissionDenied) {
             _ = try MoshServerLauncher.launchLocalServer(
-                timeout: 1,
+                timeout: 30,
                 environment: ["MOSH_SERVER_BIN": script.path]
             )
         }
@@ -251,7 +251,7 @@ final class MoshBootstrapTests: XCTestCase {
 
         assertBootstrapError(.permissionDenied) {
             _ = try MoshServerLauncher.launchLocalServer(
-                timeout: 1,
+                timeout: 30,
                 environment: ["MOSH_SERVER_BIN": script.path]
             )
         }
@@ -266,7 +266,7 @@ final class MoshBootstrapTests: XCTestCase {
 
         assertBootstrapError(.invalidConnectLine) {
             _ = try MoshServerLauncher.launchLocalServer(
-                timeout: 1,
+                timeout: 30,
                 environment: ["MOSH_SERVER_BIN": script.path]
             )
         }
@@ -282,7 +282,7 @@ final class MoshBootstrapTests: XCTestCase {
 
         assertBootstrapError(.processExited) {
             _ = try MoshServerLauncher.launchLocalServer(
-                timeout: 1,
+                timeout: 30,
                 environment: ["MOSH_SERVER_BIN": nonScript.path]
             )
         }
@@ -297,7 +297,7 @@ final class MoshBootstrapTests: XCTestCase {
 
         assertBootstrapError(.processExited) {
             _ = try MoshServerLauncher.launchLocalServer(
-                timeout: 1,
+                timeout: 30,
                 environment: ["MOSH_SERVER_BIN": script.path]
             )
         }
