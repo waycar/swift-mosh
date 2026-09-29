@@ -115,6 +115,18 @@ taken.
    child exits, and returns no pid without it; `MoshProtocolE2ETests`' own
    launcher parses the line instead of returning its child's pid. A pid of 0
    or 1 is not a server's and is ignored.
+10. **Process-local transport clock** (`TransportClock.nowMs()`). Upstream
+    returned milliseconds since device boot (`ProcessInfo.systemUptime`), and
+    that value mod 65536 goes into every datagram's timestamp. The app's
+    privacy manifest declares boot-time access with reason `35F9.1`, which
+    lets only elapsed time between in-app events leave the device, so the
+    clock now counts from its first reading in this process, plus 1000 ms so
+    a reading is never 0 (callers treat 0 as "unset"). It stays monotonic.
+    Readings are not comparable across launches; nothing compares them so
+    (`MoshSnapshot.createdAtMs` and the transport snapshot's
+    `lastSentAtMs`/`lastReceivedAtMs` are stored but never read back as
+    times, and `install(blob:)` restarts retransmit timers from the current
+    reading).
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
@@ -134,7 +146,8 @@ outliving two `MOSH_SERVER_NETWORK_TMOUT` periods. `MoshBootstrapTests`
 covers the launcher waiting for the detached pid, reporting none without it,
 and ignoring pids 0 and 1. Not covered: the reply's step off `UInt16.max`,
 cancelling a transport restart, refusing `start()` during a stop, and the
-debug line.
+debug line. `TransportTests` covers the process-local clock (non-zero, starts
+small, never decreases).
 
 ## Known limitations
 

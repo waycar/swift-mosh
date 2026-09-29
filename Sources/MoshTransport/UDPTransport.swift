@@ -32,9 +32,21 @@ public enum TransportError: Error, Sendable {
     case malformedDatagram
 }
 
+/// Milliseconds since this process first read the clock, plus
+/// `originOffsetMs` so a reading is never 0 (0 means "unset" to callers).
+/// Datagram timestamps carry this value, so only in-app elapsed time leaves
+/// the device, never time since boot (privacy manifest reason 35F9.1).
+/// Values are meaningless across launches. (Waycar patch.)
 public enum TransportClock {
+    public static let originOffsetMs: UInt64 = 1_000
+
+    /// Set on first use; Swift runs a static initializer exactly once, thread-safely.
+    private static let originUptime = ProcessInfo.processInfo.systemUptime
+
     public static func nowMs() -> UInt64 {
-        UInt64(ProcessInfo.processInfo.systemUptime * 1_000)
+        let origin = originUptime
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - origin)
+        return originOffsetMs + UInt64(elapsed * 1_000)
     }
 }
 

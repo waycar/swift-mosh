@@ -16,6 +16,38 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(decoded, address)
     }
 
+    /// Datagram timestamps must carry in-app elapsed time, not time since
+    /// boot (privacy manifest reason 35F9.1). (Waycar patch.)
+    func testTransportClockCountsFromFirstReadingAndNeverDecreases() throws {
+        var previous = TransportClock.nowMs()
+        XCTAssertGreaterThanOrEqual(previous, TransportClock.originOffsetMs, "0 means unset to callers")
+        // The first reading may come from an earlier test, so bound the clock
+        // by this process's age: well under 60 s early in a run, and never
+        // anywhere near time since boot.
+        let processAgeMs = try XCTUnwrap(Self.processAgeMs())
+        XCTAssertLessThanOrEqual(previous - TransportClock.originOffsetMs, processAgeMs + 1_000)
+        if processAgeMs < 50_000 {
+            XCTAssertLessThan(previous, 60_000)
+        }
+
+        for _ in 0..<10_000 {
+            let now = TransportClock.nowMs()
+            XCTAssertGreaterThanOrEqual(now, previous)
+            previous = now
+        }
+    }
+
+    private static func processAgeMs() -> UInt64? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0 else { return nil }
+        let start = info.kp_proc.p_un.__p_starttime
+        let startSeconds = Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
+        let age = Date().timeIntervalSince1970 - startSeconds
+        return age >= 0 ? UInt64(age * 1_000) : nil
+    }
+
     func testInMemoryEndpointLifecycleAndDelivery() async throws {
         let (left, right) = await InMemoryDatagramPair.makeLinked()
 
