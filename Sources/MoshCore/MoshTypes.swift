@@ -18,11 +18,17 @@ public struct MoshClientConfig: Sendable, Hashable, Codable {
     public var maxReceiveStates: Int
     public var ackIntervalMs: UInt32
     public var ackDelayMs: UInt32
+    /// How long the session runs without an authenticated server datagram
+    /// before it fails with `MoshSessionFailure.timeout`; time the process
+    /// spent suspended counts. (Waycar patch: upstream never enforced it.)
     public var networkTimeoutMs: UInt32
     public var maxRetransmitCount: UInt32
     public var initialRtoMs: UInt32
     public var maxRtoMs: UInt32
     public var heartbeatIntervalMs: UInt32
+    /// How long without an authenticated server datagram before the session
+    /// reports `.stalled` connectivity. (Waycar patch.)
+    public var stallThresholdMs: UInt32
     public var mtu: Int
     public var localPort: UInt16?
     public var useNetworkCrypto: Bool
@@ -37,6 +43,7 @@ public struct MoshClientConfig: Sendable, Hashable, Codable {
         initialRtoMs: UInt32 = 600,
         maxRtoMs: UInt32 = 4_000,
         heartbeatIntervalMs: UInt32 = 3_000,
+        stallThresholdMs: UInt32 = 5_000,
         mtu: Int = 1200,
         localPort: UInt16? = nil,
         useNetworkCrypto: Bool = true
@@ -50,10 +57,46 @@ public struct MoshClientConfig: Sendable, Hashable, Codable {
         self.initialRtoMs = max(50, initialRtoMs)
         self.maxRtoMs = max(self.initialRtoMs, maxRtoMs)
         self.heartbeatIntervalMs = max(250, heartbeatIntervalMs)
+        self.stallThresholdMs = max(1, stallThresholdMs)
         self.mtu = max(128, mtu)
         self.localPort = localPort
         self.useNetworkCrypto = useNetworkCrypto
     }
+}
+
+extension MoshClientConfig {
+    private enum CodingKeys: String, CodingKey {
+        case sendMinDelayMs, maxReceiveStates, ackIntervalMs, ackDelayMs, networkTimeoutMs
+        case maxRetransmitCount, initialRtoMs, maxRtoMs, heartbeatIntervalMs, stallThresholdMs
+        case mtu, localPort, useNetworkCrypto
+    }
+
+    /// (Waycar patch) Configs encoded before `stallThresholdMs` existed decode
+    /// with its default.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sendMinDelayMs = try container.decode(UInt32.self, forKey: .sendMinDelayMs)
+        maxReceiveStates = try container.decode(Int.self, forKey: .maxReceiveStates)
+        ackIntervalMs = try container.decode(UInt32.self, forKey: .ackIntervalMs)
+        ackDelayMs = try container.decode(UInt32.self, forKey: .ackDelayMs)
+        networkTimeoutMs = try container.decode(UInt32.self, forKey: .networkTimeoutMs)
+        maxRetransmitCount = try container.decode(UInt32.self, forKey: .maxRetransmitCount)
+        initialRtoMs = try container.decode(UInt32.self, forKey: .initialRtoMs)
+        maxRtoMs = try container.decode(UInt32.self, forKey: .maxRtoMs)
+        heartbeatIntervalMs = try container.decode(UInt32.self, forKey: .heartbeatIntervalMs)
+        stallThresholdMs = try container.decodeIfPresent(UInt32.self, forKey: .stallThresholdMs) ?? 5_000
+        mtu = try container.decode(Int.self, forKey: .mtu)
+        localPort = try container.decodeIfPresent(UInt16.self, forKey: .localPort)
+        useNetworkCrypto = try container.decode(Bool.self, forKey: .useNetworkCrypto)
+    }
+}
+
+/// Whether the server is being heard from, judged by the time since the
+/// session's last authenticated server datagram against
+/// `MoshClientConfig.stallThresholdMs`. (Waycar patch.)
+public enum MoshConnectivity: Sendable, Hashable {
+    case connected
+    case stalled
 }
 
 public struct MoshSnapshot: Sendable, Hashable, Codable {
@@ -181,6 +224,8 @@ public enum MoshSessionState: Sendable, Hashable, Codable {
 }
 
 public enum MoshSessionFailure: Sendable, Hashable, Codable, Error {
+    /// No authenticated server datagram for `networkTimeoutMs`. (Waycar
+    /// patch: upstream declared it but never raised it.)
     case timeout(timeoutMs: UInt32)
     case protocolViolation(String)
     case authenticationFailure(String)

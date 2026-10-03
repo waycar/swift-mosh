@@ -84,6 +84,19 @@ public actor MoshClientSession {
 
     private var consecutiveReceiveFailures: UInt32 = 0
 
+    /// When the last authenticated server datagram arrived, or the session
+    /// started if none has since. Drives connectivity and the network
+    /// timeout; kept across an app suspension so time suspended counts.
+    /// (Waycar patch.)
+    private var lastServerContactAtMs: UInt64 = 0
+    /// The connectivity last published to `connectivityStream()`; nil while
+    /// the session is not running. (Waycar patch.)
+    private(set) public var connectivity: MoshConnectivity?
+    private var connectivityContinuations: [UUID: AsyncStream<MoshConnectivity>.Continuation] = [:]
+    /// The receive loop waiting for a transport replacement to connect,
+    /// resumed once it is installed or the runtime stops. (Waycar patch.)
+    private var transportWaiters: [CheckedContinuation<Void, Never>] = []
+
     private var hostStreamContinuations: [UUID: AsyncStream<MoshHostOp>.Continuation] = [:]
 
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
@@ -115,6 +128,13 @@ public actor MoshClientSession {
     }
 
     public func start() async throws {
+        try await startRuntime(resettingServerContact: true)
+    }
+
+    /// `resettingServerContact` is false when resuming from the background:
+    /// silence before and during the suspension still counts toward the
+    /// network timeout. (Waycar patch.)
+    private func startRuntime(resettingServerContact: Bool) async throws {
         if case .running = state {
             return
         }
@@ -186,8 +206,12 @@ public actor MoshClientSession {
         currentRtoMs = Double(config.initialRtoMs)
         srttMs = nil
         rttvarMs = nil
+        if resettingServerContact || lastServerContactAtMs == 0 {
+            lastServerContactAtMs = now // (Waycar patch)
+        }
 
         state = .running
+        updateConnectivity(nowMs: now) // (Waycar patch)
         self.receiveTask = Task { [weak self] in
             await self?.receiveLoop()
         }
@@ -226,6 +250,79 @@ public actor MoshClientSession {
         localShutdownTask = nil
     }
 
+    /// Ends the session at once, without the shutdown handshake: for a
+    /// server presumed dead, where `shutdown(ackTimeoutMs:)` would only wait
+    /// out its deadline. Nothing more is sent. The runtime stops, which also
+    /// ends a `shutdown(ackTimeoutMs:)` in flight (its callers return), the
+    /// host and connectivity streams finish, and unacknowledged input is
+    /// dropped. The session ends `.stopped`, or stays `.failed` with its
+    /// failure. (Waycar patch: `stop()` keeps that input and overwrites a
+    /// failed state.)
+    public func abandon() async {
+        if case .failed = state {
+            await shutdownRuntime()
+        } else {
+            state = .stopping
+            await shutdownRuntime()
+            state = .stopped
+        }
+        pendingTransportSnapshot = nil
+        pendingOutbound.removeAll()
+        pendingOutboundOrder.removeAll()
+    }
+
+    /// Replaces the UDP flow at once with a new one, on a fresh ephemeral
+    /// local port unless `config.localPort` pins one, then resends the
+    /// current state: every unacknowledged state, or with none a new empty
+    /// state, which the server acknowledges promptly. The server roams to
+    /// the new address on that first authenticated datagram. For network
+    /// path changes, where the old flow may be bound to an interface that is
+    /// gone. Returns once the new flow is installed and the state resent, or
+    /// when the session stops running; it can wait as long as the new flow
+    /// takes to connect (while offline, until the network returns). Input
+    /// queued meanwhile is retransmitted. A session that is not running is
+    /// left alone. (Waycar patch.)
+    public func rebindTransport() async {
+        guard state == .running else { return }
+        if let current = engine {
+            // Unstructured so cancelling the caller cannot strand the session
+            // without a transport halfway through the swap.
+            _ = await Task { await self.restartTransport(after: current) }.value
+        }
+        // Also covers a replacement already in flight, which is a new flow too.
+        await waitForTransport()
+        guard state == .running, engine != nil else { return }
+        await resendCurrentState()
+    }
+
+    /// Connectivity transitions while the session runs: the current value on
+    /// subscription once running, then each change. `.stalled` once
+    /// `config.stallThresholdMs` passes without an authenticated server
+    /// datagram (the session counts as heard from when it starts),
+    /// `.connected` as soon as one arrives. A healthy idle session stays
+    /// `.connected`: the heartbeat's new state draws the server's ack. Not
+    /// evaluated while suspended; finishes when the session stops or fails.
+    /// (Waycar patch.)
+    public func connectivityStream() -> AsyncStream<MoshConnectivity> {
+        let streamID = UUID()
+        return AsyncStream(MoshConnectivity.self, bufferingPolicy: .unbounded) { continuation in
+            switch self.state {
+            case .stopping, .stopped, .failed:
+                continuation.finish()
+                return
+            case .idle, .starting, .running, .suspending, .suspended:
+                break
+            }
+            if let connectivity = self.connectivity {
+                continuation.yield(connectivity)
+            }
+            self.connectivityContinuations[streamID] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeConnectivityContinuation(streamID) }
+            }
+        }
+    }
+
     public func prepareForApplicationBackground() async throws -> MoshSnapshot {
         switch state {
         case .running:
@@ -248,7 +345,7 @@ public actor MoshClientSession {
             return
         case .suspended:
             state = .idle
-            try await start()
+            try await startRuntime(resettingServerContact: false)
         case .failed(let failure):
             throw MoshSessionError.sessionFailed(failure)
         case .idle, .starting, .suspending, .stopping, .stopped:
@@ -469,6 +566,14 @@ public actor MoshClientSession {
         guard case .running = state else { return false }
 
         let now = TransportClock.nowMs()
+        // (Waycar patch) Measured from the last server datagram on the
+        // process clock, which keeps counting while the process is
+        // suspended, so the first pass after a long suspension ends it.
+        if now >= lastServerContactAtMs, now - lastServerContactAtMs >= UInt64(config.networkTimeoutMs) {
+            await failSession(.timeout(timeoutMs: config.networkTimeoutMs))
+            return false
+        }
+        updateConnectivity(nowMs: now) // (Waycar patch)
         do {
             try await processRetransmitQueue(nowMs: now)
             try await maybeSendAck(nowMs: now)
@@ -497,11 +602,19 @@ public actor MoshClientSession {
 
     private func runReceiveLoopIteration() async -> Bool {
         guard let engine else {
+            // (Waycar patch) A transport replacement is connecting: wait for
+            // it instead of spinning.
+            await waitForTransport()
             return state == .running && !Task.isCancelled
         }
 
         do {
             let incoming = try await engine.receivePayload()
+            // (Waycar patch) With network crypto on (always, in the app) the
+            // engine returns only datagrams that authenticated: contact with
+            // the server.
+            lastServerContactAtMs = TransportClock.nowMs()
+            updateConnectivity(nowMs: lastServerContactAtMs)
             updateRtt(from: incoming)
 
             let hostOps = try decodeHostOps(from: incoming)
@@ -530,6 +643,11 @@ public actor MoshClientSession {
         } catch {
             if Task.isCancelled || state == .stopping || state == .stopped {
                 return false
+            }
+            // (Waycar patch) `rebindTransport()` replaced the engine this
+            // receive was waiting on: not a failure of the current transport.
+            if self.engine !== engine {
+                return state == .running
             }
 
             let disposition = classifyReceiveError(error)
@@ -566,18 +684,25 @@ public actor MoshClientSession {
         )
     }
 
+    /// Replaces `failedEngine` with a fresh engine (a new UDP flow) carrying
+    /// its sequence state, retrying until one connects or the session stops
+    /// running. Returns whether the session still runs. (Waycar patch) The
+    /// engine is claimed before any suspension, so only one replacement runs
+    /// at a time (a receive failure and `rebindTransport()` can both ask),
+    /// and the old engine is stopped before its sequence state is read, so
+    /// no datagram it sends can reuse a sequence number (the cipher's nonce)
+    /// the replacement sends again. That state sits in
+    /// `pendingTransportSnapshot` meanwhile, for a snapshot or suspension
+    /// taken before a replacement is installed.
     private func restartTransport(after failedEngine: TransportEngine) async -> Bool {
         guard state == .running, engine === failedEngine else {
-            return state == .running && engine != nil
-        }
-
-        let snapshot = await failedEngine.makeSnapshot()
-        guard state == .running, engine === failedEngine else {
-            return state == .running && engine != nil
+            return state == .running
         }
 
         engine = nil
         await failedEngine.stop()
+        let snapshot = await failedEngine.makeSnapshot()
+        pendingTransportSnapshot = snapshot
 
         var retryDelayMs: UInt64 = 50
         while state == .running, !Task.isCancelled {
@@ -596,7 +721,9 @@ public actor MoshClientSession {
                     return false
                 }
                 engine = replacement
+                pendingTransportSnapshot = nil
                 lastOutboundAtMs = TransportClock.nowMs()
+                resumeTransportWaiters()
                 return true
             } catch {
                 if debugEnabled {
@@ -607,6 +734,50 @@ public actor MoshClientSession {
             }
         }
         return false
+    }
+
+    /// Waits while the session runs without a transport, until a
+    /// replacement is installed or the runtime stops. (Waycar patch.)
+    private func waitForTransport() async {
+        guard engine == nil, state == .running else { return }
+        await withCheckedContinuation { transportWaiters.append($0) }
+    }
+
+    private func resumeTransportWaiters() {
+        let waiters = transportWaiters
+        transportWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Sends the current state on a new transport at once, instead of when
+    /// retransmission or the heartbeat next falls due. (Waycar patch.)
+    private func resendCurrentState() async {
+        let now = TransportClock.nowMs()
+        if pendingOutboundOrder.isEmpty {
+            try? await sendIdleState(nowMs: now)
+            return
+        }
+        for stateNum in pendingOutboundOrder {
+            pendingOutbound[stateNum]?.nextRetryAtMs = now
+        }
+        try? await processRetransmitQueue(nowMs: now)
+    }
+
+    /// Publishes a connectivity change, judged at `nowMs` from the last
+    /// server contact. (Waycar patch.)
+    private func updateConnectivity(nowMs: UInt64) {
+        guard state == .running else { return }
+        let silentMs = nowMs >= lastServerContactAtMs ? nowMs - lastServerContactAtMs : 0
+        let current: MoshConnectivity = silentMs >= UInt64(config.stallThresholdMs) ? .stalled : .connected
+        guard current != connectivity else { return }
+        connectivity = current
+        for continuation in connectivityContinuations.values {
+            continuation.yield(current)
+        }
+    }
+
+    private func removeConnectivityContinuation(_ streamID: UUID) {
+        connectivityContinuations.removeValue(forKey: streamID)
     }
 
     func _testRunReceiveLoopIteration() async -> Bool {
@@ -843,11 +1014,7 @@ public actor MoshClientSession {
         if state == .running, pendingOutboundOrder.isEmpty, nowMs >= lastNewStateAtMs,
            nowMs - lastNewStateAtMs >= UInt64(config.heartbeatIntervalMs)
         {
-            try await sendNewState(diff: nil)
-            lastAckSentAtMs = nowMs
-            lastAckReportedNum = latestReceivedStateNum
-            ackDirtyAtMs = nil
-            reackRequested = false
+            try await sendIdleState(nowMs: nowMs)
             return
         }
         guard nowMs >= lastOutboundAtMs else { return }
@@ -867,6 +1034,16 @@ public actor MoshClientSession {
         lastAckReportedNum = latestReceivedStateNum
         ackDirtyAtMs = nil
         reackRequested = false // (Waycar patch)
+    }
+
+    /// A new, empty state, which also reports the latest received state.
+    /// (Waycar patch.)
+    private func sendIdleState(nowMs: UInt64) async throws {
+        try await sendNewState(diff: nil)
+        lastAckSentAtMs = nowMs
+        lastAckReportedNum = latestReceivedStateNum
+        ackDirtyAtMs = nil
+        reackRequested = false
     }
 
     private func sendAckOnly(nowMs: UInt64) async throws {
@@ -991,6 +1168,14 @@ public actor MoshClientSession {
         }
         engine = nil
         finishHostStreams()
+        // (Waycar patch)
+        resumeTransportWaiters()
+        connectivity = nil
+        let connectivityContinuations = connectivityContinuations.values
+        self.connectivityContinuations.removeAll()
+        for continuation in connectivityContinuations {
+            continuation.finish()
+        }
     }
 
     private func suspendRuntime() async {
@@ -999,6 +1184,9 @@ public actor MoshClientSession {
         receiveTask = nil
         maintenanceTask = nil
 
+        // (Waycar patch) Connectivity is judged only while running.
+        connectivity = nil
+        resumeTransportWaiters()
         await cancelStartingEngine() // (Waycar patch)
         guard let activeEngine = engine else { return }
         await activeEngine.stop()

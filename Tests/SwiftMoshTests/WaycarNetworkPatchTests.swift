@@ -1,0 +1,514 @@
+import Darwin
+import Foundation
+import XCTest
+@testable import MoshCompression
+@testable import MoshCore
+@testable import MoshCryptoOCB
+@testable import MoshProtoLite
+@testable import MoshTransport
+@testable import MoshWire
+
+/// Waycar patches 11–14 (see PROVENANCE.md): connectivity, the enforced
+/// network timeout, `rebindTransport()` and `abandon()`. Helpers are shared
+/// with `WaycarPatchTests.swift`.
+extension WaycarPatchTests {
+    // MARK: - Connectivity
+
+    func testConnectivityStallsOnSilenceAndRecoversOnTheNextServerDatagram() async throws {
+        var config = MoshClientConfig()
+        config.stallThresholdMs = 200
+        config.heartbeatIntervalMs = 10_000
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        let log = ConnectivityLog()
+        let collector = log.collect(await session.connectivityStream())
+
+        let connected = await waitUntil(within: 1) { await log.values == [.connected] }
+        XCTAssertTrue(connected, "a running session reports its connectivity on subscription")
+        let stalled = await waitUntil(within: 2) { await log.values == [.connected, .stalled] }
+        XCTAssertTrue(stalled, "silence past the threshold must report a stall")
+
+        try await sendAck(from: server, ackNum: 0)
+        let recovered = await waitUntil(within: 1) { await log.values == [.connected, .stalled, .connected] }
+        XCTAssertTrue(recovered, "the next server datagram must report the session connected again")
+
+        await session.stop()
+        let finished = await waitUntil(within: 1) { await log.isFinished }
+        XCTAssertTrue(finished, "the stream ends with the session")
+        await collector.value
+        await serverEnd.stop()
+    }
+
+    func testHeartbeatsKeepAHealthyIdleSessionConnectedAndAlive() async throws {
+        var config = MoshClientConfig()
+        config.heartbeatIntervalMs = 100
+        config.stallThresholdMs = 400
+        config.networkTimeoutMs = 600
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        // Acks every new client state, as mosh-server does within its ack delay.
+        let responder = Task {
+            while let received = try? await server.receivePayload() {
+                guard
+                    let plain = try? MoshCompressionCodec().decompress(received.payload, algorithm: .zlib),
+                    let instruction = try? TransportInstruction(decoding: plain),
+                    let newNum = instruction.newNum, newNum != UInt64.max
+                else { continue }
+                try? await server.sendPayload(try ackPayload(newNum))
+            }
+        }
+        let log = ConnectivityLog()
+        let collector = log.collect(await session.connectivityStream())
+
+        // Several stall thresholds and network timeouts without any input.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        let values = await log.values
+        XCTAssertEqual(values, [.connected], "an idle session the server answers must never stall")
+        let state = await session.state
+        XCTAssertEqual(state, .running, "server contact must keep resetting the network timeout")
+
+        await session.stop()
+        await collector.value
+        await serverEnd.stop()
+        await responder.value
+    }
+
+    // MARK: - Network timeout
+
+    func testTimeSuspendedCountsTowardTheNetworkTimeout() async throws {
+        var config = MoshClientConfig()
+        config.networkTimeoutMs = 800
+        config.heartbeatIntervalMs = 10_000
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        try await sendAck(from: server, ackNum: 0)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        _ = try await session.prepareForApplicationBackground()
+        try await Task.sleep(nanoseconds: 900_000_000)
+        try await session.resumeFromApplicationBackground()
+
+        // Counting from the resume instead would leave it running 800 ms more.
+        let timedOut = await waitUntil(within: 0.4) {
+            await session.state == .failed(.timeout(timeoutMs: 800))
+        }
+        XCTAssertTrue(timedOut, "silence across the suspension must end the session promptly on resume")
+
+        await session.abandon()
+        let state = await session.state
+        XCTAssertEqual(state, .failed(.timeout(timeoutMs: 800)), "abandoning a failed session keeps its failure")
+        await serverEnd.stop()
+    }
+
+    // MARK: - Rebind
+
+    func testRebindMovesToAFreshFlowAndResendsTheCurrentState() async throws {
+        var config = MoshClientConfig()
+        config.sendMinDelayMs = 0
+        config.initialRtoMs = 5_000
+        config.maxRtoMs = 5_000
+        config.heartbeatIntervalMs = 10_000
+        let serverEnd = InMemoryDatagramEndpoint()
+        try await serverEnd.start()
+        let flows = FlowRegistry(server: serverEnd)
+        let (session, server) = try await makeSession(config: config, serverEnd: serverEnd, flows: flows)
+
+        try await session.enqueue(.keystrokes(Data("x".utf8)))
+        let first = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+
+        await session.rebindTransport()
+
+        XCTAssertEqual(flows.count, 2, "a rebind opens a new flow")
+        let oldFlowStopped = await flows.flow(0)?.isStopped
+        XCTAssertEqual(oldFlowStopped, true, "the old flow is released")
+        // The retransmission timeout is 5 s: only the rebind sends it now.
+        let resent = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+        XCTAssertEqual(resent.diff, first.diff, "the unacknowledged state is resent on the new flow")
+
+        // The server roams to the new flow; its datagrams must still arrive.
+        try await sendState(from: server, old: 0, new: 1, text: "after-rebind")
+        let delivered = await waitUntil(within: 1) {
+            await session.drainHostOps().contains(.hostBytes(Data("after-rebind".utf8)))
+        }
+        XCTAssertTrue(delivered, "the receive loop must follow the new flow")
+
+        try await sendAck(from: server, ackNum: 1)
+        let acked = await waitUntil(within: 1) { await session._testPendingOutboundCount() == 0 }
+        XCTAssertTrue(acked)
+        await session.rebindTransport()
+        XCTAssertEqual(flows.count, 3)
+        let idle = try await nextInstruction(from: server, serverEnd) { $0.newNum == 2 }
+        XCTAssertNil(idle.diff, "with nothing unacknowledged the rebind sends a new empty state")
+
+        await session.stop()
+        await serverEnd.stop()
+    }
+
+    func testTheServersFirstReplyAfterARebindIsNotHeldByAReceiveBackoff() async throws {
+        var config = MoshClientConfig()
+        config.heartbeatIntervalMs = 10_000
+        let serverEnd = InMemoryDatagramEndpoint()
+        try await serverEnd.start()
+        let flows = FlowRegistry(server: serverEnd)
+        let (session, server) = try await makeSession(config: config, serverEnd: serverEnd, flows: flows)
+        let hostOps = await session.hostOpStream()
+        let log = HostTextLog()
+        let collector = log.collect(hostOps)
+
+        let started = TransportClock.nowMs()
+        await session.rebindTransport()
+        try await sendState(from: server, old: 0, new: 1, text: "reply")
+        let delivered = await waitUntil(within: 1) { await log.texts == ["reply"] }
+        let arrivedAt = await log.lastArrivalMs
+
+        XCTAssertTrue(delivered)
+        // Treating the old flow's end as a receive failure sleeps 50 ms first.
+        XCTAssertLessThan(arrivedAt - started, 40, "the receive loop must move to the new flow at once")
+
+        await session.stop()
+        await collector.value
+        await serverEnd.stop()
+    }
+
+    func testRebindSendsFromAFreshEphemeralLocalPort() async throws {
+        let probe = try UDPProbe()
+        defer { probe.close() }
+        var config = MoshClientConfig()
+        config.sendMinDelayMs = 0
+        config.initialRtoMs = 5_000
+        config.maxRtoMs = 5_000
+        config.heartbeatIntervalMs = 10_000
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(
+                host: "127.0.0.1", port: probe.port,
+                keyBase64_22: try MoshBase64Key(raw: Data(repeating: 0x42, count: 16)).printable),
+            config: config)
+        try await session.start()
+
+        try await session.enqueue(.keystrokes(Data("x".utf8)))
+        let before = await probe.nextSourcePort()
+        await session.rebindTransport()
+        let after = await probe.nextSourcePort()
+
+        XCTAssertNotNil(before)
+        XCTAssertNotNil(after, "the rebind must resend the state from the new flow at once")
+        XCTAssertNotEqual(before, after, "the new flow must use a new local port")
+        await session.abandon()
+    }
+
+    func testASnapshotDuringATransportSwapKeepsTheSequenceState() async throws {
+        let serverEnd = InMemoryDatagramEndpoint()
+        try await serverEnd.start()
+        let stalledFlow = NeverReadyDatagramEndpoint()
+        let flows = FlowRegistry(server: serverEnd, laterFlows: stalledFlow)
+        let (session, _) = try await makeSession(config: MoshClientConfig(), serverEnd: serverEnd, flows: flows)
+        try await session.enqueue(.keystrokes(Data("x".utf8)))
+
+        let (rebound, finish) = AsyncStream<Void>.makeStream()
+        Task {
+            await session.rebindTransport()
+            finish.finish()
+        }
+        let waiting = await waitUntil(within: 1) { await stalledFlow.isWaitingToStart }
+        XCTAssertTrue(waiting, "the new flow must still be connecting")
+
+        let snapshot = try await session.makeSnapshot()
+        let blob = try JSONDecoder().decode(SessionStateBlob.self, from: snapshot.transportState)
+        XCTAssertGreaterThan(
+            blob.transport.nextOutgoingSequence, 0,
+            "restarting from sequence 0 would reuse the cipher's nonces")
+
+        await session.stop()
+        let returned = await finishes(rebound, within: 1)
+        XCTAssertTrue(returned, "a rebind waiting on a flow returns once the session stops")
+        await serverEnd.stop()
+    }
+
+    // MARK: - Abandon
+
+    func testAbandonStopsAtOnceWithoutTheShutdownHandshake() async throws {
+        let (session, server, serverEnd) = try await makeLinkedSession(config: MoshClientConfig())
+        let log = AckLog()
+        let recorder = recordAcks(from: server, into: log)
+        let hostOps = await session.hostOpStream()
+        let connectivity = await session.connectivityStream()
+        try await session.enqueue(.keystrokes(Data("x".utf8)))
+        let sent = await waitUntil(within: 1) { await log.newNums().contains(1) }
+        XCTAssertTrue(sent)
+
+        let started = TransportClock.nowMs()
+        await session.abandon()
+
+        XCTAssertLessThan(TransportClock.nowMs() - started, 200, "a dead server must not hold the end")
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
+        let failure = await session.failure
+        XCTAssertNil(failure)
+        let pending = await session._testPendingOutboundCount()
+        XCTAssertEqual(pending, 0, "undeliverable input is dropped")
+        let hostOpsEnded = await streamFinishes(hostOps, within: 1)
+        XCTAssertTrue(hostOpsEnded)
+        let connectivityEnded = await streamFinishes(connectivity, within: 1)
+        XCTAssertTrue(connectivityEnded)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let newNums = await log.newNums()
+        XCTAssertFalse(newNums.contains(UInt64.max), "no shutdown state is sent")
+        do {
+            try await session.enqueue(.keystrokes(Data("late".utf8)))
+            XCTFail("an abandoned session must refuse input")
+        } catch MoshSessionError.notStarted {
+        }
+
+        await serverEnd.stop()
+        await recorder.value
+    }
+
+    func testAbandonEndsAShutdownWaitingForAnAck() async throws {
+        let (session, server, serverEnd) = try await makeLinkedSession(config: MoshClientConfig())
+        let log = AckLog()
+        let recorder = recordAcks(from: server, into: log)
+        let shutdown = Task { await session.shutdown(ackTimeoutMs: 5_000) }
+        let inFlight = await waitUntil(within: 1) { await log.newNums().contains(UInt64.max) }
+        XCTAssertTrue(inFlight, "the shutdown must be waiting for its ack")
+
+        let started = TransportClock.nowMs()
+        await session.abandon()
+        await shutdown.value
+
+        XCTAssertLessThan(TransportClock.nowMs() - started, 500, "the shutdown's caller must not wait out its deadline")
+        let state = await session.state
+        XCTAssertEqual(state, .stopped)
+        await serverEnd.stop()
+        await recorder.value
+    }
+
+    // MARK: - Start
+
+    func testFirstInputAfterStartIsSentWithoutPacing() async throws {
+        var config = MoshClientConfig()
+        config.sendMinDelayMs = 1_000
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+
+        // mosh-server's command starts only on the first client datagram, and
+        // the app's first input is its initial size.
+        let started = TransportClock.nowMs()
+        try await session.enqueue(.resize(cols: 80, rows: 24))
+        XCTAssertLessThan(TransportClock.nowMs() - started, 200, "the first state must not wait out the pacing delay")
+        let first = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+        XCTAssertNotNil(first.diff)
+
+        await session.stop()
+        await serverEnd.stop()
+    }
+
+    // MARK: - Config
+
+    func testConfigEncodedBeforeTheStallThresholdDecodesWithItsDefault() throws {
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(MoshClientConfig(stallThresholdMs: 1_234)))
+                as? [String: Any])
+        XCTAssertEqual(object["stallThresholdMs"] as? Int, 1_234)
+        object.removeValue(forKey: "stallThresholdMs")
+        let decoded = try JSONDecoder().decode(
+            MoshClientConfig.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(decoded, MoshClientConfig())
+    }
+
+    // MARK: - Helpers
+
+    /// A session whose every transport is a new flow from `flows`.
+    private func makeSession(
+        config: MoshClientConfig, serverEnd: InMemoryDatagramEndpoint, flows: FlowRegistry
+    ) async throws -> (MoshClientSession, TransportEngine) {
+        let key = Data(repeating: 0x42, count: 16)
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(
+                host: "127.0.0.1", port: 60001,
+                keyBase64_22: try MoshBase64Key(raw: key).printable),
+            config: config,
+            endpointFactory: { _, _ in flows.make() },
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+        )
+        try await session.start()
+        let server = TransportEngine(
+            endpoint: serverEnd, outgoingDirection: .toClient,
+            cipher: try OCBTransportCipher(key: key))
+        return (session, server)
+    }
+
+    private func streamFinishes<Element: Sendable>(
+        _ stream: AsyncStream<Element>, within seconds: Double
+    ) async -> Bool {
+        let (ended, end) = AsyncStream<Void>.makeStream()
+        Task {
+            for await _ in stream {}
+            end.finish()
+        }
+        return await finishes(ended, within: seconds)
+    }
+}
+
+private func ackPayload(_ ackNum: UInt64) throws -> Data {
+    let instruction = TransportInstruction(
+        protocolVersion: 2, oldNum: 0, newNum: 0, ackNum: ackNum, throwawayNum: 0,
+        diff: nil, chaff: Data())
+    return try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib)
+}
+
+/// Connectivity values a session published, in order.
+private actor ConnectivityLog {
+    private(set) var values: [MoshConnectivity] = []
+    private(set) var isFinished = false
+
+    nonisolated func collect(_ stream: AsyncStream<MoshConnectivity>) -> Task<Void, Never> {
+        Task {
+            for await value in stream { await append(value) }
+            await finish()
+        }
+    }
+
+    private func append(_ value: MoshConnectivity) {
+        values.append(value)
+    }
+
+    private func finish() {
+        isFinished = true
+    }
+}
+
+/// Host text a session delivered, and when the last of it arrived.
+private actor HostTextLog {
+    private(set) var texts: [String] = []
+    private(set) var lastArrivalMs: UInt64 = 0
+
+    nonisolated func collect(_ stream: AsyncStream<MoshHostOp>) -> Task<Void, Never> {
+        Task {
+            for await op in stream {
+                if case .hostBytes(let data) = op {
+                    await append(String(decoding: data, as: UTF8.self))
+                }
+            }
+        }
+    }
+
+    private func append(_ text: String) {
+        texts.append(text)
+        lastArrivalMs = TransportClock.nowMs()
+    }
+}
+
+/// One client flow: a fresh in-memory endpoint that, once started, is the
+/// one the server sends to, as mosh-server follows a roaming client.
+private actor RoamingClientEndpoint: DatagramEndpoint {
+    private let inner = InMemoryDatagramEndpoint()
+    private let server: InMemoryDatagramEndpoint
+    private(set) var isStopped = false
+
+    init(server: InMemoryDatagramEndpoint) {
+        self.server = server
+    }
+
+    func start() async throws {
+        try await inner.start()
+        await inner.link(server)
+        await server.link(inner)
+    }
+
+    func stop() async {
+        isStopped = true
+        await inner.stop()
+    }
+
+    func send(_ data: Data) async throws {
+        try await inner.send(data)
+    }
+
+    func receive() async throws -> TransportDatagram {
+        try await inner.receive()
+    }
+}
+
+/// Hands the session a new flow for each transport it makes; with
+/// `laterFlows`, every flow after the first is that endpoint instead.
+private final class FlowRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private let server: InMemoryDatagramEndpoint
+    private let laterFlows: (any DatagramEndpoint)?
+    private var flows: [RoamingClientEndpoint] = []
+    private var made = 0
+
+    init(server: InMemoryDatagramEndpoint, laterFlows: (any DatagramEndpoint)? = nil) {
+        self.server = server
+        self.laterFlows = laterFlows
+    }
+
+    var count: Int {
+        lock.withLock { made }
+    }
+
+    func flow(_ index: Int) -> RoamingClientEndpoint? {
+        lock.withLock { flows.indices.contains(index) ? flows[index] : nil }
+    }
+
+    func make() -> any DatagramEndpoint {
+        lock.withLock {
+            made += 1
+            if made > 1, let laterFlows { return laterFlows }
+            let flow = RoamingClientEndpoint(server: server)
+            flows.append(flow)
+            return flow
+        }
+    }
+}
+
+/// A UDP socket on loopback that reports each datagram's source port.
+private final class UDPProbe: @unchecked Sendable {
+    private let descriptor: Int32
+    let port: UInt16
+
+    init() throws {
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        address.sin_port = 0
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &length)
+            }
+        }
+        guard bound == 0, named == 0 else {
+            Darwin.close(fd)
+            throw POSIXError(.EADDRNOTAVAIL)
+        }
+        descriptor = fd
+        port = UInt16(bigEndian: address.sin_port)
+    }
+
+    /// The source port of the next datagram, or nil after 2 s without one.
+    func nextSourcePort() async -> UInt16? {
+        await Task.detached { [descriptor] () -> UInt16? in
+            var buffer = [UInt8](repeating: 0, count: 2_048)
+            var source = sockaddr_in()
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let count = withUnsafeMutablePointer(to: &source) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    recvfrom(descriptor, &buffer, buffer.count, 0, $0, &length)
+                }
+            }
+            return count > 0 ? UInt16(bigEndian: source.sin_port) : nil
+        }.value
+    }
+
+    func close() {
+        Darwin.close(descriptor)
+    }
+}

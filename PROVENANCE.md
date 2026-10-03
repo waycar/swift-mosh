@@ -122,11 +122,57 @@ taken.
     lets only elapsed time between in-app events leave the device, so the
     clock now counts from its first reading in this process, plus 1000 ms so
     a reading is never 0 (callers treat 0 as "unset"). It stays monotonic.
+    It reads `ContinuousClock`, which keeps counting while the device sleeps
+    (`systemUptime` does not), so the network timeout (patch 12) counts a
+    suspension in full.
     Readings are not comparable across launches; nothing compares them so
     (`MoshSnapshot.createdAtMs` and the transport snapshot's
     `lastSentAtMs`/`lastReceivedAtMs` are stored but never read back as
     times, and `install(blob:)` restarts retransmit timers from the current
     reading).
+11. **Connectivity** (`MoshClientSession.connectivityStream()`,
+    `connectivity`, `MoshClientConfig.stallThresholdMs`, `MoshConnectivity`).
+    The session records when its last authenticated server datagram arrived
+    (start counts as contact) and publishes `.stalled` once
+    `stallThresholdMs` (default 5 s) passes without one, `.connected` as soon
+    as one arrives. Judged on each maintenance pass (50 ms) and on receipt,
+    only while running; the stream yields the current value on subscription
+    and finishes when the session stops or fails. A healthy idle session
+    stays connected: the 3 s heartbeat is a new state (patch 8), which
+    mosh-server acknowledges. Configs encoded without the threshold decode
+    with the default. Upstream had no liveness signal at all.
+12. **Network timeout enforced** (`MoshClientConfig.networkTimeoutMs`).
+    Upstream declared it (default 30 s) and `MoshSessionFailure.timeout` but
+    used neither, so a dead server left the session running forever. Now
+    no authenticated server datagram for that long fails the session with
+    `.timeout(timeoutMs:)`. It is measured from the last contact on
+    `TransportClock`, so time the process spent suspended counts: the first
+    maintenance pass after a long suspension ends the session, and
+    `resumeFromApplicationBackground()` keeps the contact time from before
+    the suspension. The upstream test asserting that silence never ends the
+    session (`testNetworkSilenceDoesNotEndSession`) now asserts the timeout.
+13. **Rebind** (`MoshClientSession.rebindTransport()`). For network path
+    changes: replaces the UDP flow at once with a new one (a new
+    `NWConnection`, so a fresh ephemeral local port unless
+    `config.localPort` pins one) and resends the current state, every
+    unacknowledged state or else a new empty state, so the server roams to
+    the new address and answers within its ack delay. It reuses the
+    transport restart, which now claims the engine before suspending (a
+    receive failure and a rebind cannot both replace it), stops the old
+    engine before reading its sequence state (no datagram it sends can
+    reuse a sequence number, the cipher's nonce, that the replacement sends
+    again), and keeps that state in the pending transport snapshot until the
+    replacement is installed, so `makeSnapshot()` or a suspension during the
+    swap no longer starts over from sequence 0. The receive loop treats the
+    end of a replaced engine's receive as no failure (no backoff sleep) and
+    waits for a replacement still connecting instead of ending or spinning.
+14. **Abandon** (`MoshClientSession.abandon()`). Ends the session at once
+    without the shutdown handshake, for a server presumed dead, where
+    `shutdown(ackTimeoutMs:)` would wait out its 1 s deadline. Nothing more
+    is sent; the runtime stops (which also ends a `shutdown` in flight), the
+    host and connectivity streams finish, unacknowledged input is dropped,
+    and a failed session keeps its failure (`stop()` keeps the input and
+    overwrites the failed state).
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
@@ -147,7 +193,24 @@ covers the launcher waiting for the detached pid, reporting none without it,
 and ignoring pids 0 and 1. Not covered: the reply's step off `UInt16.max`,
 cancelling a transport restart, refusing `start()` during a stop, and the
 debug line. `TransportTests` covers the process-local clock (non-zero, starts
-small, never decreases).
+small, never decreases); that it counts device sleep is not testable on the
+host.
+
+`Tests/SwiftMoshTests/WaycarNetworkPatchTests.swift` covers patches 11–14:
+connectivity stalling on silence, recovering on the next server datagram
+and finishing with the session; an idle session the server answers staying
+connected and alive across several thresholds and timeouts; time suspended
+counting toward the timeout on resume (and `CoreAndAdapterTests` the timeout
+itself); a rebind opening a new flow, releasing the old one, resending the
+unacknowledged state (or a new empty state), still receiving from the
+server, receiving its first reply without a backoff, sending from a new
+local port on real loopback UDP, keeping the sequence state in a snapshot
+taken mid-swap and returning when the session stops; `abandon()` returning
+at once without a shutdown state, dropping unacknowledged input, finishing
+both streams, ending a `shutdown` in flight and keeping a failure; configs
+encoded without the stall threshold; and the first input after `start()`
+going out without the pacing delay (mosh-server starts its command on the
+first client datagram, which is the app's initial size).
 
 ## Known limitations
 

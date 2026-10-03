@@ -378,7 +378,9 @@ final class CoreAndAdapterTests: XCTestCase {
         await server.stop()
     }
 
-    func testNetworkSilenceDoesNotEndSession() async throws {
+    /// (Waycar patch) Upstream never enforced `networkTimeoutMs`; this test
+    /// asserted the session outlived it.
+    func testNetworkSilenceEndsSessionWithTimeoutFailure() async throws {
         var config = MoshClientConfig(
             sendMinDelayMs: 0,
             maxReceiveStates: 8,
@@ -397,12 +399,27 @@ final class CoreAndAdapterTests: XCTestCase {
         let (session, server) = await makeInMemorySession(config: config)
         try await server.start()
         try await session.start()
+        let started = TransportClock.nowMs()
 
-        try await Task.sleep(nanoseconds: 900_000_000)
-        let state = await session.state
-        XCTAssertEqual(state, .running)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let early = await session.state
+        XCTAssertEqual(early, .running, "the session must run until the timeout")
 
-        await session.stop()
+        var state = await session.state
+        while state == .running, TransportClock.nowMs() - started < 3_000 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            state = await session.state
+        }
+        XCTAssertEqual(state, .failed(.timeout(timeoutMs: 500)))
+        XCTAssertGreaterThanOrEqual(TransportClock.nowMs() - started, 500)
+        let failure = await session.failure
+        XCTAssertEqual(failure, .timeout(timeoutMs: 500))
+        do {
+            try await session.enqueue(.keystrokes(Data("late".utf8)))
+            XCTFail("a timed-out session must refuse input")
+        } catch MoshSessionError.sessionFailed(.timeout(timeoutMs: 500)) {
+        }
+
         await server.stop()
     }
 

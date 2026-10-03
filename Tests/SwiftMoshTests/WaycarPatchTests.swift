@@ -330,10 +330,10 @@ final class WaycarPatchTests: XCTestCase {
         await recorder.value
     }
 
-    // MARK: - Helpers
+    // MARK: - Helpers (shared with WaycarNetworkPatchTests.swift)
 
     /// Ack and new state numbers the client sent, in arrival order.
-    private actor AckLog {
+    actor AckLog {
         private var entries: [UInt64] = []
         private var newStateNums: [UInt64] = []
 
@@ -359,7 +359,7 @@ final class WaycarPatchTests: XCTestCase {
     /// The client's in-memory endpoint with sends a test can hold, like an
     /// NWConnection whose send completion has not fired. `stop()` fails the
     /// held sends, as cancelling that connection does.
-    private actor HeldSendDatagramEndpoint: DatagramEndpoint {
+    actor HeldSendDatagramEndpoint: DatagramEndpoint {
         private let inner: InMemoryDatagramEndpoint
         private var holding = false
         private var held: [CheckedContinuation<Void, Error>] = []
@@ -412,7 +412,7 @@ final class WaycarPatchTests: XCTestCase {
     /// An endpoint whose network path never becomes ready, like
     /// `NetworkDatagramEndpoint` offline or for a host that does not
     /// resolve: `start()` waits until `stop()` cancels it.
-    private actor NeverReadyDatagramEndpoint: DatagramEndpoint {
+    actor NeverReadyDatagramEndpoint: DatagramEndpoint {
         private var startContinuation: CheckedContinuation<Void, Error>?
 
         var isWaitingToStart: Bool {
@@ -439,14 +439,14 @@ final class WaycarPatchTests: XCTestCase {
         }
     }
 
-    private func makeLinkedSession(
+    func makeLinkedSession(
         config: MoshClientConfig
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint) {
         let (session, server, serverEnd, _) = try await makeHeldSendSession(config: config)
         return (session, server, serverEnd)
     }
 
-    private func makeHeldSendSession(
+    func makeHeldSendSession(
         config: MoshClientConfig
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint, HeldSendDatagramEndpoint) {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
@@ -468,7 +468,7 @@ final class WaycarPatchTests: XCTestCase {
         return (session, server, serverEnd, client)
     }
 
-    private func sendState(from server: TransportEngine, old: UInt64, new: UInt64, text: String) async throws {
+    func sendState(from server: TransportEngine, old: UInt64, new: UInt64, text: String) async throws {
         let instruction = TransportInstruction(
             protocolVersion: 2, oldNum: old, newNum: new, ackNum: 0, throwawayNum: 0,
             diff: HostMessage(instructions: [.hostBytes(Data(text.utf8))]).encoded(),
@@ -477,7 +477,7 @@ final class WaycarPatchTests: XCTestCase {
             try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib))
     }
 
-    private func sendAck(from server: TransportEngine, ackNum: UInt64) async throws {
+    func sendAck(from server: TransportEngine, ackNum: UInt64) async throws {
         let instruction = TransportInstruction(
             protocolVersion: 2, oldNum: 0, newNum: 0, ackNum: ackNum, throwawayNum: 0,
             diff: nil, chaff: Data())
@@ -487,7 +487,7 @@ final class WaycarPatchTests: XCTestCase {
 
     /// The first instruction from the client that `matches`, within 2 s.
     /// Stops `serverEnd` on timeout, since its receive ignores cancellation.
-    private func nextInstruction(
+    func nextInstruction(
         from server: TransportEngine, _ serverEnd: InMemoryDatagramEndpoint,
         where matches: @escaping @Sendable (TransportInstruction) -> Bool
     ) async throws -> TransportInstruction {
@@ -516,7 +516,7 @@ final class WaycarPatchTests: XCTestCase {
 
     /// Records every instruction the client sends, until the server
     /// endpoint stops.
-    private func recordAcks(from server: TransportEngine, into log: AckLog) -> Task<Void, Never> {
+    func recordAcks(from server: TransportEngine, into log: AckLog) -> Task<Void, Never> {
         Task {
             while let received = try? await server.receivePayload() {
                 guard
@@ -529,7 +529,7 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     /// Whether `stream` finishes within `seconds`.
-    private func finishes(_ stream: AsyncStream<Void>, within seconds: Double) async -> Bool {
+    func finishes(_ stream: AsyncStream<Void>, within seconds: Double) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 for await _ in stream {}
@@ -545,7 +545,7 @@ final class WaycarPatchTests: XCTestCase {
         }
     }
 
-    private func collectTexts(
+    func collectTexts(
         from stream: AsyncStream<MoshHostOp>, within seconds: Double
     ) async throws -> [String] {
         let texts = await withTaskGroup(of: [String]?.self) { group in
@@ -569,7 +569,7 @@ final class WaycarPatchTests: XCTestCase {
         return try XCTUnwrap(texts, "the host stream did not finish within \(seconds)s")
     }
 
-    private func waitUntil(
+    func waitUntil(
         within seconds: Double, _ condition: @Sendable () async -> Bool
     ) async -> Bool {
         let deadline = TransportClock.nowMs() + UInt64(seconds * 1000)

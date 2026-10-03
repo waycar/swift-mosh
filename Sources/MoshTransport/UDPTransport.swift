@@ -36,17 +36,20 @@ public enum TransportError: Error, Sendable {
 /// `originOffsetMs` so a reading is never 0 (0 means "unset" to callers).
 /// Datagram timestamps carry this value, so only in-app elapsed time leaves
 /// the device, never time since boot (privacy manifest reason 35F9.1).
-/// Values are meaningless across launches. (Waycar patch.)
+/// Values are meaningless across launches. It counts time the process or
+/// the device spent suspended or asleep (`ContinuousClock`), so silence
+/// measured across a suspension is real elapsed time. (Waycar patch.)
 public enum TransportClock {
     public static let originOffsetMs: UInt64 = 1_000
 
     /// Set on first use; Swift runs a static initializer exactly once, thread-safely.
-    private static let originUptime = ProcessInfo.processInfo.systemUptime
+    private static let origin = ContinuousClock.now
 
     public static func nowMs() -> UInt64 {
-        let origin = originUptime
-        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - origin)
-        return originOffsetMs + UInt64(elapsed * 1_000)
+        let elapsed = origin.duration(to: ContinuousClock.now).components
+        let wholeMs = UInt64(max(0, elapsed.seconds)) * 1_000
+        let fractionMs = UInt64(max(0, elapsed.attoseconds)) / 1_000_000_000_000_000
+        return originOffsetMs + wholeMs + fractionMs
     }
 }
 
