@@ -30,10 +30,15 @@ extension WaycarPatchTests {
         try await sendAck(from: server, ackNum: 0)
         let recovered = await waitUntil(within: 1) { await log.values == [.connected, .stalled, .connected] }
         XCTAssertTrue(recovered, "the next server datagram must report the session connected again")
+        // Within the threshold of that datagram it must stay connected.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let afterContact = await log.values
+        XCTAssertEqual(afterContact, [.connected, .stalled, .connected], "the datagram must count as contact")
 
         await session.stop()
         let finished = await waitUntil(within: 1) { await log.isFinished }
         XCTAssertTrue(finished, "the stream ends with the session")
+        collector.cancel() // Only reached unfinished when the assertion above failed.
         await collector.value
         await serverEnd.stop()
     }
@@ -67,6 +72,7 @@ extension WaycarPatchTests {
         XCTAssertEqual(state, .running, "server contact must keep resetting the network timeout")
 
         await session.stop()
+        collector.cancel()
         await collector.value
         await serverEnd.stop()
         await responder.value
@@ -164,6 +170,7 @@ extension WaycarPatchTests {
         XCTAssertLessThan(arrivedAt - started, 40, "the receive loop must move to the new flow at once")
 
         await session.stop()
+        collector.cancel()
         await collector.value
         await serverEnd.stop()
     }
@@ -199,26 +206,37 @@ extension WaycarPatchTests {
         try await serverEnd.start()
         let stalledFlow = NeverReadyDatagramEndpoint()
         let flows = FlowRegistry(server: serverEnd, laterFlows: stalledFlow)
-        let (session, _) = try await makeSession(config: MoshClientConfig(), serverEnd: serverEnd, flows: flows)
-        try await session.enqueue(.keystrokes(Data("x".utf8)))
+        weak var released: MoshClientSession?
+        do {
+            let (session, _) = try await makeSession(config: MoshClientConfig(), serverEnd: serverEnd, flows: flows)
+            released = session
+            try await session.enqueue(.keystrokes(Data("x".utf8)))
 
-        let (rebound, finish) = AsyncStream<Void>.makeStream()
-        Task {
-            await session.rebindTransport()
-            finish.finish()
+            let (rebound, finish) = AsyncStream<Void>.makeStream()
+            Task {
+                await session.rebindTransport()
+                finish.finish()
+            }
+            let waiting = await waitUntil(within: 1) { await stalledFlow.isWaitingToStart }
+            XCTAssertTrue(waiting, "the new flow must still be connecting")
+
+            let snapshot = try await session.makeSnapshot()
+            let blob = try JSONDecoder().decode(SessionStateBlob.self, from: snapshot.transportState)
+            XCTAssertGreaterThan(
+                blob.transport.nextOutgoingSequence, 0,
+                "restarting from sequence 0 would reuse the cipher's nonces")
+
+            await session.stop()
+            let returned = await finishes(rebound, within: 1)
+            XCTAssertTrue(returned, "a rebind waiting on a flow returns once the session stops")
         }
-        let waiting = await waitUntil(within: 1) { await stalledFlow.isWaitingToStart }
-        XCTAssertTrue(waiting, "the new flow must still be connecting")
-
-        let snapshot = try await session.makeSnapshot()
-        let blob = try JSONDecoder().decode(SessionStateBlob.self, from: snapshot.transportState)
-        XCTAssertGreaterThan(
-            blob.transport.nextOutgoingSequence, 0,
-            "restarting from sequence 0 would reuse the cipher's nonces")
-
-        await session.stop()
-        let returned = await finishes(rebound, within: 1)
-        XCTAssertTrue(returned, "a rebind waiting on a flow returns once the session stops")
+        // The receive loop waits for the new flow while it connects; the stop
+        // must end that wait, or its task keeps the session alive forever.
+        let deadline = TransportClock.nowMs() + 1_000
+        while released != nil, TransportClock.nowMs() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(released, "a stopped session must not be kept alive by its receive loop")
         await serverEnd.stop()
     }
 
