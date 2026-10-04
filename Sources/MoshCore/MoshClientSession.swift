@@ -51,6 +51,9 @@ public actor MoshClientSession {
     /// When this client last sent a new state; drives the heartbeat state.
     /// (Waycar patch.)
     private var lastNewStateAtMs: UInt64 = 0
+    /// The size the last `enqueue(.resize(cols:rows:))` sent, which
+    /// `elicitServerReply()` repeats. (Waycar patch.)
+    private var lastSentSize: (cols: Int32, rows: Int32)?
 
     private var ackDirtyAtMs: UInt64?
     private var lastAckSentAtMs: UInt64 = 0
@@ -83,6 +86,8 @@ public actor MoshClientSession {
     private static let shutdownPollIntervalMs: UInt64 = 10
 
     private var consecutiveReceiveFailures: UInt32 = 0
+    /// Receive-failure backoff sleeps taken, for tests. (Waycar patch.)
+    private var receiveBackoffCount = 0
 
     /// When the last authenticated server datagram arrived, or the session
     /// started if none has since. Drives connectivity and the network
@@ -272,16 +277,19 @@ public actor MoshClientSession {
     }
 
     /// Replaces the UDP flow at once with a new one, on a fresh ephemeral
-    /// local port unless `config.localPort` pins one, then resends the
-    /// current state: every unacknowledged state, or with none a new empty
-    /// state, which the server acknowledges promptly. The server roams to
-    /// the new address on that first authenticated datagram. For network
-    /// path changes, where the old flow may be bound to an interface that is
-    /// gone. Returns once the new flow is installed and the state resent, or
-    /// when the session stops running; it can wait as long as the new flow
-    /// takes to connect (while offline, until the network returns). Input
-    /// queued meanwhile is retransmitted. A session that is not running is
-    /// left alone. (Waycar patch.)
+    /// local port unless `config.localPort` pins one, resends every
+    /// unacknowledged state, then sends `elicitServerReply()`'s state. The
+    /// server roams to the new address on the first authenticated datagram
+    /// and, with a size sent before, answers that state within its ack delay
+    /// (100 ms): the roam is confirmed within about one round trip plus that
+    /// delay. A resent state draws no prompt reply (mosh-server ignores a
+    /// state it already holds), and neither does an empty one (see
+    /// `elicitServerReply()`). For network path changes, where the old flow
+    /// may be bound to an interface that is gone. Returns once the new flow
+    /// is installed and the states sent, or when the session stops running;
+    /// it can wait as long as the new flow takes to connect (while offline,
+    /// until the network returns). Input queued meanwhile is retransmitted.
+    /// A session that is not running is left alone. (Waycar patch.)
     public func rebindTransport() async {
         guard state == .running else { return }
         if let current = engine {
@@ -292,17 +300,45 @@ public actor MoshClientSession {
         // Also covers a replacement already in flight, which is a new flow too.
         await waitForTransport()
         guard state == .running, engine != nil else { return }
-        await resendCurrentState()
+        await resendUnacknowledgedStates()
+        await elicitServerReply()
+    }
+
+    /// Sends a new client state that mosh-server answers within its ack
+    /// delay (100 ms), for a caller that needs to hear from the server now:
+    /// to confirm a roam, or to check that an idle session is alive.
+    /// mosh-server 1.4 acknowledges a new state at once only when its diff
+    /// is non-empty; it answers an empty one (the idle heartbeat) on its 3 s
+    /// ack interval. So the state repeats the last size sent with
+    /// `enqueue(.resize(cols:rows:))`: the server's terminal already has that
+    /// size, and a same-size `TIOCSWINSZ` raises no SIGWINCH on Linux or the
+    /// BSDs, so its command sees nothing. Returns true when it sent that.
+    /// Before any resize there is nothing harmless to repeat: it sends a new
+    /// empty state instead (which still reports this client's address and
+    /// acks) and returns false, and the reply comes on the server's ack
+    /// interval. Returns false without sending when the session is not
+    /// running. Not paced by `config.sendMinDelayMs`; delivered by
+    /// retransmission if its first send fails. (Waycar patch.)
+    @discardableResult
+    public func elicitServerReply() async -> Bool {
+        guard state == .running else { return false }
+        let diff = lastSentSize.map {
+            UserMessage(instructions: [.resize(width: $0.cols, height: $0.rows)]).encoded()
+        }
+        try? await sendStateReportingAcks(diff: diff, nowMs: TransportClock.nowMs())
+        return diff != nil
     }
 
     /// Connectivity transitions while the session runs: the current value on
     /// subscription once running, then each change. `.stalled` once
     /// `config.stallThresholdMs` passes without an authenticated server
     /// datagram (the session counts as heard from when it starts),
-    /// `.connected` as soon as one arrives. A healthy idle session stays
-    /// `.connected`: the heartbeat's new state draws the server's ack. Not
-    /// evaluated while suspended; finishes when the session stops or fails.
-    /// (Waycar patch.)
+    /// `.connected` as soon as one arrives. mosh-server answers an idle
+    /// client's empty heartbeat states only on its 3 s ack interval, so a
+    /// threshold above two of those intervals (mosh's own client uses 6.5 s)
+    /// keeps a healthy idle session `.connected` across one lost datagram.
+    /// Not evaluated while suspended; finishes when the session stops or
+    /// fails. (Waycar patch.)
     public func connectivityStream() -> AsyncStream<MoshConnectivity> {
         let streamID = UUID()
         return AsyncStream(MoshConnectivity.self, bufferingPolicy: .unbounded) { continuation in
@@ -367,6 +403,9 @@ public actor MoshClientSession {
 
         let diff = try encodeUserDiff(from: op)
         try await sendNewState(diff: diff)
+        if case .resize(let cols, let rows) = op {
+            lastSentSize = (cols, rows) // (Waycar patch)
+        }
     }
 
     private func requireRunning() throws {
@@ -662,6 +701,7 @@ public actor MoshClientSession {
                 if debugEnabled {
                     debugLog("transient receive error (\(consecutiveReceiveFailures)): \(message)")
                 }
+                receiveBackoffCount += 1 // (Waycar patch)
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
                 guard !Task.isCancelled, state == .running else { return false }
                 return await restartTransport(after: engine)
@@ -749,14 +789,10 @@ public actor MoshClientSession {
         for waiter in waiters { waiter.resume() }
     }
 
-    /// Sends the current state on a new transport at once, instead of when
-    /// retransmission or the heartbeat next falls due. (Waycar patch.)
-    private func resendCurrentState() async {
+    /// Retransmits every unacknowledged state on a new transport at once,
+    /// instead of when its retransmission next falls due. (Waycar patch.)
+    private func resendUnacknowledgedStates() async {
         let now = TransportClock.nowMs()
-        if pendingOutboundOrder.isEmpty {
-            try? await sendIdleState(nowMs: now)
-            return
-        }
         for stateNum in pendingOutboundOrder {
             pendingOutbound[stateNum]?.nextRetryAtMs = now
         }
@@ -786,6 +822,14 @@ public actor MoshClientSession {
 
     func _testPendingOutboundCount() -> Int {
         pendingOutbound.count
+    }
+
+    func _testReceiveBackoffCount() -> Int {
+        receiveBackoffCount
+    }
+
+    func _testLastServerContactAtMs() -> UInt64 {
+        lastServerContactAtMs
     }
 
     private func encodeUserDiff(from op: MoshClientOp) throws -> Data {
@@ -1014,7 +1058,7 @@ public actor MoshClientSession {
         if state == .running, pendingOutboundOrder.isEmpty, nowMs >= lastNewStateAtMs,
            nowMs - lastNewStateAtMs >= UInt64(config.heartbeatIntervalMs)
         {
-            try await sendIdleState(nowMs: nowMs)
+            try await sendStateReportingAcks(diff: nil, nowMs: nowMs)
             return
         }
         guard nowMs >= lastOutboundAtMs else { return }
@@ -1036,10 +1080,10 @@ public actor MoshClientSession {
         reackRequested = false // (Waycar patch)
     }
 
-    /// A new, empty state, which also reports the latest received state.
-    /// (Waycar patch.)
-    private func sendIdleState(nowMs: UInt64) async throws {
-        try await sendNewState(diff: nil)
+    /// A new state with `diff`, which also reports the latest received
+    /// state. (Waycar patch.)
+    private func sendStateReportingAcks(diff: Data?, nowMs: UInt64) async throws {
+        try await sendNewState(diff: diff)
         lastAckSentAtMs = nowMs
         lastAckReportedNum = latestReceivedStateNum
         ackDirtyAtMs = nil

@@ -137,9 +137,11 @@ taken.
     `stallThresholdMs` (default 5 s) passes without one, `.connected` as soon
     as one arrives. Judged on each maintenance pass (50 ms) and on receipt,
     only while running; the stream yields the current value on subscription
-    and finishes when the session stops or fails. A healthy idle session
-    stays connected: the 3 s heartbeat is a new state (patch 8), which
-    mosh-server acknowledges. Configs encoded without the threshold decode
+    and finishes when the session stops or fails. mosh-server 1.4 answers
+    an idle client's empty heartbeat state (patch 8) only on its 3 s ack
+    interval, so a healthy idle session hears from it about every 3 s: a
+    threshold above two intervals (mosh's own client uses 6.5 s) rides out
+    one lost datagram. Configs encoded without the threshold decode
     with the default. Upstream had no liveness signal at all.
 12. **Network timeout enforced** (`MoshClientConfig.networkTimeoutMs`).
     Upstream declared it (default 30 s) and `MoshSessionFailure.timeout` but
@@ -154,11 +156,13 @@ taken.
 13. **Rebind** (`MoshClientSession.rebindTransport()`). For network path
     changes: replaces the UDP flow at once with a new one (a new
     `NWConnection`, so a fresh ephemeral local port unless
-    `config.localPort` pins one) and resends the current state, every
-    unacknowledged state or else a new empty state, so the server roams to
-    the new address and answers within its ack delay. It reuses the
-    transport restart, which now claims the engine before suspending (a
-    receive failure and a rebind cannot both replace it), stops the old
+    `config.localPort` pins one), resends every unacknowledged state and
+    then sends patch 15's state, so the server roams to the new address
+    and, with a size sent before, answers within its 100 ms ack delay (a
+    resent state it already holds draws no reply; an empty one waits for
+    its 3 s ack interval). It reuses the transport restart, which now
+    claims the engine before suspending (a receive failure and a rebind
+    cannot both replace it), stops the old
     engine before reading its sequence state (no datagram it sends can
     reuse a sequence number, the cipher's nonce, that the replacement sends
     again), and keeps that state in the pending transport snapshot until the
@@ -173,6 +177,17 @@ taken.
     host and connectivity streams finish, unacknowledged input is dropped,
     and a failed session keeps its failure (`stop()` keeps the input and
     overwrites the failed state).
+15. **Elicited reply** (`MoshClientSession.elicitServerReply()`). mosh-server
+    1.4 acknowledges a new client state at once only when its diff is
+    non-empty (`Transport::recv` calls `set_data_ack()` only then); an empty
+    state waits for its 3 s ack interval. To hear from the server now (a
+    roam, a liveness check) this sends a new state repeating the last size
+    sent with `enqueue(.resize(cols:rows:))`: a no-op for the server, since
+    its terminal has that size and a same-size `TIOCSWINSZ` raises no
+    SIGWINCH on Linux or the BSDs. Before any resize it falls back to a new
+    empty state and returns false (no prompt reply due); keystrokes are
+    never repeated. Not paced by `sendMinDelayMs`; returns false without
+    sending when not running.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
@@ -196,21 +211,29 @@ debug line. `TransportTests` covers the process-local clock (non-zero, starts
 small, never decreases); that it counts device sleep is not testable on the
 host.
 
-`Tests/SwiftMoshTests/WaycarNetworkPatchTests.swift` covers patches 11–14:
+`Tests/SwiftMoshTests/WaycarNetworkPatchTests.swift` covers patches 11–15:
 connectivity stalling on silence, recovering on the next server datagram
-and finishing with the session; an idle session the server answers staying
-connected and alive across several thresholds and timeouts; time suspended
-counting toward the timeout on resume (and `CoreAndAdapterTests` the timeout
-itself); a rebind opening a new flow, releasing the old one, resending the
-unacknowledged state (or a new empty state), still receiving from the
-server, receiving its first reply without a backoff, sending from a new
-local port on real loopback UDP, keeping the sequence state in a snapshot
-taken mid-swap and returning when the session stops; `abandon()` returning
-at once without a shutdown state, dropping unacknowledged input, finishing
-both streams, ending a `shutdown` in flight and keeping a failure; configs
-encoded without the stall threshold; and the first input after `start()`
-going out without the pacing delay (mosh-server starts its command on the
-first client datagram, which is the app's initial size).
+(which counts as contact) and finishing with the session; an idle session
+the server answers staying connected and alive across several thresholds
+and timeouts; time suspended counting toward the timeout on resume (and
+`CoreAndAdapterTests` the timeout itself); a rebind opening a new flow,
+releasing the old one, resending the unacknowledged state and then a new
+state, still receiving from the server, receiving its first reply without
+a receive backoff sleep, drawing a prompt reply from a server that acks
+only non-empty states, sending from a new local port on real loopback UDP,
+keeping the sequence state in a snapshot taken mid-swap and returning when
+the session stops; `elicitServerReply()` repeating the last size (not the
+last input) and drawing that server's reply, falling back to an empty
+state before any resize, and sending nothing once stopped; `abandon()`
+returning without a shutdown state, dropping unacknowledged input,
+finishing both streams, ending a `shutdown` in flight and keeping a
+failure; configs encoded without the stall threshold; and the first input
+after `start()` going out without the pacing delay (mosh-server starts its
+command on the first client datagram, which is the app's initial size).
+The rebind, abandon and first-input cases assert the mechanism (no backoff
+sleep taken, contact recorded, states sent) rather than elapsed times of
+tens of milliseconds. The real-server suite also proves an idle mosh-server
+answers the elicited state well inside its 3 s ack interval.
 
 ## Known limitations
 

@@ -3,6 +3,7 @@ import Foundation
 import XCTest
 @testable import MoshBootstrap
 @testable import MoshCore
+import MoshTransport
 
 final class RealMoshServerE2ETests: XCTestCase {
     func testRealMoshServerRepeatedColdRelaunchRecovery() async throws {
@@ -203,6 +204,67 @@ final class RealMoshServerE2ETests: XCTestCase {
             session: session, containing: "__SWIFTMOSH_IDLE_2__", timeoutSeconds: 3, throwOnTimeout: true)
 
         await session.shutdown()
+    }
+
+    /// An idle mosh-server answers an empty client state only on its 3 s
+    /// ack interval, but a non-empty one within its 100 ms ack delay: the
+    /// state `elicitServerReply()` sends must draw a prompt reply. (Waycar
+    /// patch.)
+    func testRealMoshServerAnswersAnElicitedStatePromptly() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
+            throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
+        }
+
+        let host = env["SWIFTMOSH_REAL_E2E_HOST"] ?? "127.0.0.1"
+        let connect = try Self.launchLocalMoshServer(environment: env)
+        let serverPID = try XCTUnwrap(connect.serverPID, "mosh-server did not report its detached pid")
+        defer {
+            if Self.isAlive(serverPID) { _ = kill(serverPID, SIGKILL) }
+        }
+
+        var config = MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
+        config.heartbeatIntervalMs = 60_000
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(host: host, port: connect.port, keyBase64_22: connect.key),
+            config: config
+        )
+        try await session.start()
+        try await session.enqueue(.resize(cols: 80, rows: 24))
+        try await session.enqueue(.keystrokes(Data("__SWIFTMOSH_ELICIT__\n".utf8)))
+        _ = try await waitForHostBytes(
+            session: session, containing: "__SWIFTMOSH_ELICIT__", timeoutSeconds: 3, throwOnTimeout: true)
+
+        for trial in 1...3 {
+            // Start right after one of the server's own datagrams, settled,
+            // so its next unprompted one is about 3 s away.
+            let previous = await session._testLastServerContactAtMs()
+            let heard = try await waitForServerContact(session: session, after: previous, timeoutMs: 4_000)
+            XCTAssertNotNil(heard, "trial \(trial): the idle server must send within its ack interval")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let settled = await session._testLastServerContactAtMs()
+
+            let sentSize = await session.elicitServerReply()
+
+            XCTAssertTrue(sentSize)
+            let reply = try await waitForServerContact(session: session, after: settled, timeoutMs: 1_000)
+            XCTAssertNotNil(reply, "trial \(trial): the elicited state must draw a reply well inside 3 s")
+        }
+
+        await session.shutdown()
+    }
+
+    /// The next server contact after `after`, or nil past `timeoutMs`.
+    private func waitForServerContact(
+        session: MoshClientSession, after: UInt64, timeoutMs: UInt64
+    ) async throws -> UInt64? {
+        let deadline = TransportClock.nowMs() + timeoutMs
+        while TransportClock.nowMs() < deadline {
+            let contact = await session._testLastServerContactAtMs()
+            if contact > after { return contact }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return nil
     }
 
     private func waitForHostBytes(
