@@ -392,10 +392,13 @@ public actor MoshClientSession {
         try requireRunning() // (Waycar patch)
 
         let diff = try encodeUserDiff(from: op)
-        try await sendNewState(diff: diff)
+        // (Waycar patch) Recorded before the send suspends, as the state
+        // itself is: an `elicitServerReply()` running in that window then
+        // repeats this size, never the one this resize replaces.
         if case .resize(let cols, let rows) = op {
-            lastSentSize = (cols, rows) // (Waycar patch)
+            lastSentSize = (cols, rows)
         }
+        try await sendNewState(diff: diff)
     }
 
     private func requireRunning() throws {

@@ -186,7 +186,11 @@ taken.
     SIGWINCH on Linux or the BSDs. Before any resize it falls back to a new
     empty state and returns false (no prompt reply due); keystrokes are
     never repeated. Not paced by `sendMinDelayMs`; returns false without
-    sending when not running.
+    sending when not running. *Amendment:* `enqueue` records a resize's size
+    before its send suspends (as patch 8 records the state itself), so
+    an elicited state racing that send repeats the new size; recording it
+    after the send let a rebind or contact check re-send the old size as a
+    later state, leaving the server's terminal at the size the client left.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a

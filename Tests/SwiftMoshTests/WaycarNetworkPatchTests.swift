@@ -298,6 +298,41 @@ extension WaycarPatchTests {
         await serverEnd.stop()
     }
 
+    /// A resize's state is recorded before its send suspends, and so is
+    /// its size: an `elicitServerReply()` that runs on the actor while that
+    /// send is out (a rebind, a server-contact check) repeats the new size.
+    /// Repeating the old one would have the server apply the new size and
+    /// then the old one, ending its terminal at the size the client left.
+    func testElicitServerReplyDuringAResizesSendRepeatsTheNewSize() async throws {
+        let (session, server, serverEnd, client) = try await makeHeldSendSession(config: idleServerConfig())
+        try await session.enqueue(.resize(cols: 100, rows: 30))
+        _ = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
+
+        await client.holdSends()
+        let resizing = Task { try await session.enqueue(.resize(cols: 120, rows: 40)) }
+        let resizeOut = await waitUntil(within: 1) { await client.heldSendCount == 1 }
+        XCTAssertTrue(resizeOut)
+        let eliciting = Task { await session.elicitServerReply() }
+        let elicitOut = await waitUntil(within: 1) { await client.heldSendCount == 2 }
+        XCTAssertTrue(elicitOut)
+        await client.releaseSends()
+        try await resizing.value
+        let sentSize = await eliciting.value
+
+        XCTAssertTrue(sentSize)
+        let elicited = try await nextInstruction(from: server, serverEnd) { $0.newNum == 3 }
+        let message = try UserMessage(decoding: try XCTUnwrap(elicited.diff))
+        guard message.instructions.count == 1, case .resize(let width, let height) = message.instructions[0] else {
+            return XCTFail("the elicited state must be a lone resize")
+        }
+        XCTAssertEqual(
+            Size(cols: width, rows: height), Size(cols: 120, rows: 40),
+            "the elicited state must repeat the resize in flight, not the one it replaced")
+
+        await session.stop()
+        await serverEnd.stop()
+    }
+
     // MARK: - Abandon
 
     func testAbandonStopsAtOnceWithoutTheShutdownHandshake() async throws {
