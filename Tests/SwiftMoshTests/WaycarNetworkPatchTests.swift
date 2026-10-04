@@ -8,9 +8,10 @@ import XCTest
 @testable import MoshTransport
 @testable import MoshWire
 
-/// Waycar patches 11–15 (see PROVENANCE.md): connectivity, the enforced
-/// network timeout, `rebindTransport()`, `abandon()` and
-/// `elicitServerReply()`. Helpers are shared with `WaycarPatchTests.swift`.
+/// Waycar patches 11, 13–15 (see PROVENANCE.md): connectivity,
+/// `rebindTransport()`, `abandon()` and `elicitServerReply()`; the network
+/// timeout (patch 12) is in `CoreAndAdapterTests`. Helpers are shared with
+/// `WaycarPatchTests.swift`.
 extension WaycarPatchTests {
     // MARK: - Connectivity
 
@@ -79,32 +80,6 @@ extension WaycarPatchTests {
         await collector.value
         await serverEnd.stop()
         await responder.value
-    }
-
-    // MARK: - Network timeout
-
-    func testTimeSuspendedCountsTowardTheNetworkTimeout() async throws {
-        var config = MoshClientConfig()
-        config.networkTimeoutMs = 800
-        config.heartbeatIntervalMs = 10_000
-        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
-        try await sendAck(from: server, ackNum: 0)
-        try await Task.sleep(nanoseconds: 100_000_000)
-
-        _ = try await session.prepareForApplicationBackground()
-        try await Task.sleep(nanoseconds: 900_000_000)
-        try await session.resumeFromApplicationBackground()
-
-        // Counting from the resume instead would leave it running 800 ms more.
-        let timedOut = await waitUntil(within: 0.4) {
-            await session.state == .failed(.timeout(timeoutMs: 800))
-        }
-        XCTAssertTrue(timedOut, "silence across the suspension must end the session promptly on resume")
-
-        await session.abandon()
-        let state = await session.state
-        XCTAssertEqual(state, .failed(.timeout(timeoutMs: 800)), "abandoning a failed session keeps its failure")
-        await serverEnd.stop()
     }
 
     // MARK: - Rebind
@@ -401,19 +376,6 @@ extension WaycarPatchTests {
         _ = try? await enqueue.value
         await session.stop()
         await serverEnd.stop()
-    }
-
-    // MARK: - Config
-
-    func testConfigEncodedBeforeTheStallThresholdDecodesWithItsDefault() throws {
-        var object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: JSONEncoder().encode(MoshClientConfig(stallThresholdMs: 1_234)))
-                as? [String: Any])
-        XCTAssertEqual(object["stallThresholdMs"] as? Int, 1_234)
-        object.removeValue(forKey: "stallThresholdMs")
-        let decoded = try JSONDecoder().decode(
-            MoshClientConfig.self, from: JSONSerialization.data(withJSONObject: object))
-        XCTAssertEqual(decoded, MoshClientConfig())
     }
 
     // MARK: - Helpers

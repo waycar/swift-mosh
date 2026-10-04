@@ -64,33 +64,6 @@ public struct MoshClientConfig: Sendable, Hashable, Codable {
     }
 }
 
-extension MoshClientConfig {
-    private enum CodingKeys: String, CodingKey {
-        case sendMinDelayMs, maxReceiveStates, ackIntervalMs, ackDelayMs, networkTimeoutMs
-        case maxRetransmitCount, initialRtoMs, maxRtoMs, heartbeatIntervalMs, stallThresholdMs
-        case mtu, localPort, useNetworkCrypto
-    }
-
-    /// (Waycar patch) Configs encoded before `stallThresholdMs` existed decode
-    /// with its default.
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        sendMinDelayMs = try container.decode(UInt32.self, forKey: .sendMinDelayMs)
-        maxReceiveStates = try container.decode(Int.self, forKey: .maxReceiveStates)
-        ackIntervalMs = try container.decode(UInt32.self, forKey: .ackIntervalMs)
-        ackDelayMs = try container.decode(UInt32.self, forKey: .ackDelayMs)
-        networkTimeoutMs = try container.decode(UInt32.self, forKey: .networkTimeoutMs)
-        maxRetransmitCount = try container.decode(UInt32.self, forKey: .maxRetransmitCount)
-        initialRtoMs = try container.decode(UInt32.self, forKey: .initialRtoMs)
-        maxRtoMs = try container.decode(UInt32.self, forKey: .maxRtoMs)
-        heartbeatIntervalMs = try container.decode(UInt32.self, forKey: .heartbeatIntervalMs)
-        stallThresholdMs = try container.decodeIfPresent(UInt32.self, forKey: .stallThresholdMs) ?? 5_000
-        mtu = try container.decode(Int.self, forKey: .mtu)
-        localPort = try container.decodeIfPresent(UInt16.self, forKey: .localPort)
-        useNetworkCrypto = try container.decode(Bool.self, forKey: .useNetworkCrypto)
-    }
-}
-
 /// Whether the server is being heard from, judged by the time since the
 /// session's last authenticated server datagram against
 /// `MoshClientConfig.stallThresholdMs`. (Waycar patch.)

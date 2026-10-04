@@ -420,6 +420,12 @@ final class CoreAndAdapterTests: XCTestCase {
         } catch MoshSessionError.sessionFailed(.timeout(timeoutMs: 500)) {
         }
 
+        // (Waycar patch) `abandon()` stops a failed session without
+        // overwriting its failure, as `stop()` would.
+        await session.abandon()
+        let abandoned = await session.state
+        XCTAssertEqual(abandoned, .failed(.timeout(timeoutMs: 500)), "abandoning a failed session keeps its failure")
+
         await server.stop()
     }
 

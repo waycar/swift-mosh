@@ -90,9 +90,8 @@ public actor MoshClientSession {
     private var receiveBackoffCount = 0
 
     /// When the last authenticated server datagram arrived, or the session
-    /// started if none has since. Drives connectivity and the network
-    /// timeout; kept across an app suspension so time suspended counts.
-    /// (Waycar patch.)
+    /// (re)started if none has since. Drives connectivity and the network
+    /// timeout. (Waycar patch.)
     private var lastServerContactAtMs: UInt64 = 0
     /// The connectivity last published to `connectivityStream()`; nil while
     /// the session is not running. (Waycar patch.)
@@ -133,13 +132,6 @@ public actor MoshClientSession {
     }
 
     public func start() async throws {
-        try await startRuntime(resettingServerContact: true)
-    }
-
-    /// `resettingServerContact` is false when resuming from the background:
-    /// silence before and during the suspension still counts toward the
-    /// network timeout. (Waycar patch.)
-    private func startRuntime(resettingServerContact: Bool) async throws {
         if case .running = state {
             return
         }
@@ -211,9 +203,7 @@ public actor MoshClientSession {
         currentRtoMs = Double(config.initialRtoMs)
         srttMs = nil
         rttvarMs = nil
-        if resettingServerContact || lastServerContactAtMs == 0 {
-            lastServerContactAtMs = now // (Waycar patch)
-        }
+        lastServerContactAtMs = now // (Waycar patch)
 
         state = .running
         updateConnectivity(nowMs: now) // (Waycar patch)
@@ -381,7 +371,7 @@ public actor MoshClientSession {
             return
         case .suspended:
             state = .idle
-            try await startRuntime(resettingServerContact: false)
+            try await start()
         case .failed(let failure):
             throw MoshSessionError.sessionFailed(failure)
         case .idle, .starting, .suspending, .stopping, .stopped:
