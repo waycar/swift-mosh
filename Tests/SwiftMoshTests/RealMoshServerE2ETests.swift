@@ -254,6 +254,66 @@ final class RealMoshServerE2ETests: XCTestCase {
         await session.shutdown()
     }
 
+    /// With acks trailing mosh-server's patience (here every client datagram
+    /// leaves 300 ms late) the server builds states on the client's last
+    /// acknowledged state, older than the screen already shown. The
+    /// terminal fed the session's host ops must still end up showing the
+    /// server's screen. (Waycar patch 16.)
+    func testRealMoshServerStatesOnOlderBasesLeaveTheTerminalRight() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
+            throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
+        }
+
+        let host = env["SWIFTMOSH_REAL_E2E_HOST"] ?? "127.0.0.1"
+        let lineCount = 300
+        let connect = try Self.launchLocalMoshServer(
+            environment: env,
+            command: "read go; i=1; while [ $i -le \(lineCount) ]; do echo \"line $i\"; i=$((i+1)); "
+                + "sleep 0.01; done; exec cat")
+        let serverPID = try XCTUnwrap(connect.serverPID, "mosh-server did not report its detached pid")
+        defer {
+            if Self.isAlive(serverPID) { _ = kill(serverPID, SIGKILL) }
+        }
+
+        var config = MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
+        config.ackDelayMs = 600
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(host: host, port: connect.port, keyBase64_22: connect.key),
+            config: config,
+            endpointFactory: { endpoint, config in
+                DelayedSendDatagramEndpoint(
+                    inner: NetworkDatagramEndpoint(
+                        remote: UDPTransportEndpointAddress(host: endpoint.host, port: endpoint.port),
+                        localPort: config.localPort),
+                    delayMs: 300)
+            },
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+        )
+        try await session.start()
+        try await session.enqueue(.resize(cols: 80, rows: 24))
+        try await session.enqueue(.keystrokes(Data("go\r".utf8)))
+
+        // The last 23 lines and the cursor's empty line below them.
+        let expected = ((lineCount - 22)...lineCount).map { "line \($0)" } + [""]
+        var display = MoshScreen(cols: 80, rows: 24)
+        let deadline = Date().addingTimeInterval(25)
+        while Date() < deadline {
+            display.apply(await session.drainHostOps())
+            if display.rowTexts == expected { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let olderBaseStates = await session._testOlderBaseStateCount()
+        await session.shutdown()
+
+        let wrongRows = zip(display.rowTexts, expected).filter { $0 != $1 }.count
+        XCTAssertEqual(
+            wrongRows, 0,
+            "rows wrong: \(wrongRows) of 24 (older-base states: \(olderBaseStates)); terminal shows \(display.rowTexts)")
+        XCTAssertGreaterThan(olderBaseStates, 0, "the server must have built states on older bases")
+        print("[older-base E2E] older-base states: \(olderBaseStates), rows wrong: \(wrongRows) of 24")
+    }
+
     /// The next server contact after `after`, or nil past `timeoutMs`.
     private func waitForServerContact(
         session: MoshClientSession, after: UInt64, timeoutMs: UInt64
@@ -298,14 +358,16 @@ final class RealMoshServerE2ETests: XCTestCase {
         return nil
     }
 
-    private static func launchLocalMoshServer(environment: [String: String]) throws -> MoshConnectInfo {
+    private static func launchLocalMoshServer(
+        environment: [String: String], command: String = "exec cat"
+    ) throws -> MoshConnectInfo {
         let bindAddress = environment["SWIFTMOSH_REAL_E2E_BIND_ADDR"] ?? "127.0.0.1"
         do {
             let connect = try MoshServerLauncher.launchLocalServer(
                 bindAddress: bindAddress,
                 timeout: 5,
                 environment: environment,
-                command: "exec cat"
+                command: command
             )
             return MoshConnectInfo(
                 port: connect.port,
@@ -352,4 +414,41 @@ private struct MoshConnectInfo {
 
 private enum RealE2EError: Error {
     case timeoutWaitingForOutput(String)
+}
+
+/// Sends each datagram `delayMs` late, in order, without holding up the
+/// caller: a slow uplink, so the client's acks trail the server's states.
+private actor DelayedSendDatagramEndpoint: DatagramEndpoint {
+    private let inner: any DatagramEndpoint
+    private let delayNs: UInt64
+    private var tail: Task<Void, Never>?
+
+    init(inner: any DatagramEndpoint, delayMs: UInt64) {
+        self.inner = inner
+        delayNs = delayMs * 1_000_000
+    }
+
+    func start() async throws {
+        try await inner.start()
+    }
+
+    func stop() async {
+        tail?.cancel()
+        await inner.stop()
+    }
+
+    func send(_ data: Data) async throws {
+        let previous = tail
+        let due = DispatchTime.now().uptimeNanoseconds + delayNs
+        tail = Task { [inner] in
+            await previous?.value
+            let now = DispatchTime.now().uptimeNanoseconds
+            if due > now { try? await Task.sleep(nanoseconds: due - now) }
+            try? await inner.send(data)
+        }
+    }
+
+    func receive() async throws -> TransportDatagram {
+        try await inner.receive()
+    }
 }

@@ -95,6 +95,8 @@ final class MoshProtocolE2ETests: XCTestCase {
     /// Simulates real mosh-server behavior: multiple state updates sent with
     /// the same oldNum (based on last acked state) before the client acks.
     /// This is the core mosh protocol pattern that strict oldNum matching breaks.
+    /// Each diff applies to that base, so the terminal must end up showing
+    /// the last state alone. (Waycar patch 16: upstream concatenated them.)
     func testServerSendsMultipleStatesBeforeClientAcks() async throws {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
         let key = Data(repeating: 0x42, count: 16)
@@ -142,19 +144,17 @@ final class MoshProtocolE2ETests: XCTestCase {
 
         // Drain all received host ops
         let ops = await session.drainHostOps()
-        let receivedTexts = ops.compactMap { op -> String? in
-            if case .hostBytes(let data) = op {
-                return String(data: data, encoding: .utf8)
-            }
-            return nil
-        }
+        var display = MoshScreen(cols: 80, rows: 24)
+        display.apply(ops)
+        let hostBytesCount = ops.filter {
+            if case .hostBytes = $0 { return true }
+            return false
+        }.count
 
         // The client MUST have received all 5 state updates
         // With the strict matching bug, only the first would be received
-        XCTAssertEqual(receivedTexts.count, 5, "Client must accept all server states, not just the first. Got: \(receivedTexts)")
-        for i in 1...5 {
-            XCTAssertTrue(receivedTexts.contains("output-\(i)\n"), "Missing output-\(i)")
-        }
+        XCTAssertEqual(hostBytesCount, 5, "Client must accept all server states, not just the first. Got: \(ops)")
+        XCTAssertEqual(display.rowTexts.prefix(2), ["output-5", ""], "the terminal shows state 5, built on state 0")
 
         await session.stop()
     }
@@ -255,9 +255,14 @@ final class MoshProtocolE2ETests: XCTestCase {
         let serverCipher = try OCBTransportCipher(key: key)
         let serverEngine = TransportEngine(endpoint: serverEnd, outgoingDirection: .toClient, cipher: serverCipher)
 
-        // Simple echo server: read client input, echo it back
+        // Simple echo server: read client input, echo it back. Like
+        // mosh-server, each state's diff turns its base (the client's last
+        // acked state) into the new state, so it carries every keystroke
+        // echoed since that base. (Waycar patch 16: the diff used to carry
+        // only the newest keystroke, whatever its base.)
         var serverAckedState: UInt64 = 0
         var serverStateNum: UInt64 = 0
+        var echoedByState: [UInt64: Data] = [0: Data()]
         let echoTask = Task {
             while !Task.isCancelled {
                 let received = try await serverEngine.receivePayload()
@@ -270,8 +275,11 @@ final class MoshProtocolE2ETests: XCTestCase {
                 guard let diff = instr.diff, let userMsg = try? UserMessage(decoding: diff) else { continue }
                 for ui in userMsg.instructions {
                     if case .keystroke(let bytes) = ui {
+                        let echoed = (echoedByState[serverStateNum] ?? Data()) + bytes
                         serverStateNum += 1
-                        let echoMsg = HostMessage(instructions: [.hostBytes(bytes)])
+                        echoedByState[serverStateNum] = echoed
+                        let base = echoedByState[serverAckedState] ?? Data()
+                        let echoMsg = HostMessage(instructions: [.hostBytes(Data(echoed.dropFirst(base.count)))])
                         let response = TransportInstruction(
                             protocolVersion: 2,
                             oldNum: serverAckedState,
@@ -294,22 +302,19 @@ final class MoshProtocolE2ETests: XCTestCase {
             try await session.enqueue(.keystrokes(Data(String(char).utf8)))
         }
 
-        // Collect echoed output within 2 seconds
-        var echoed = Data()
+        // Collect echoed output within 2 seconds, on a terminal
+        var display = MoshScreen(cols: 80, rows: 24)
         let deadline = Date().addingTimeInterval(2.0)
         while Date() < deadline {
-            let ops = await session.drainHostOps()
-            for op in ops {
-                if case .hostBytes(let bytes) = op { echoed.append(bytes) }
-            }
-            if echoed.count >= input.count { break }
+            display.apply(await session.drainHostOps())
+            if display.text(ofRow: 0) == input { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
 
         echoTask.cancel()
         await session.stop()
 
-        let echoedStr = String(data: echoed, encoding: .utf8) ?? ""
+        let echoedStr = display.text(ofRow: 0)
         XCTAssertEqual(echoedStr, input, "All keystrokes must be echoed. Got '\(echoedStr)' expected '\(input)'")
     }
 

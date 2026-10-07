@@ -103,6 +103,29 @@ public actor MoshClientSession {
 
     private var hostStreamContinuations: [UUID: AsyncStream<MoshHostOp>.Continuation] = [:]
 
+    /// Recent server states as screens, by state number, for applying each
+    /// diff to its stated base. State 0 is mosh-server's initial screen: a
+    /// blank 80×24 (the first state resizes and repaints whenever the real
+    /// size differs). Pruned on the server's throwaway number and capped at
+    /// `maxHeldScreens`; the displayed state is always kept. (Waycar patch:
+    /// client screen model.)
+    private var screens: [UInt64: MoshScreen] = [0: MoshScreen(cols: 80, rows: 24)]
+    /// The state whose screen the host-op stream last brought the terminal
+    /// to, and that screen. (Waycar patch.)
+    private var displayedNum: UInt64 = 0
+    private var displayedScreen = MoshScreen(cols: 80, rows: 24)
+    /// Whether a state has reached `displayedScreen` yet. (Waycar patch.)
+    private var hasDisplayedState = false
+    /// False for a session restored from a snapshot, which holds no
+    /// screens: the terminal may show content `displayedScreen` lacks, so
+    /// the session passes the server's diffs through as upstream did and
+    /// never repaints. (Waycar patch.)
+    private var screensMatchTerminal = true
+    /// States received on a base older than the displayed one, for tests.
+    /// (Waycar patch.)
+    private var olderBaseStateCount = 0
+    private static let maxHeldScreens = 256
+
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
 
     public init(endpoint: MoshEndpoint, config: MoshClientConfig = .init()) {
@@ -470,6 +493,17 @@ public actor MoshClientSession {
         }
     }
 
+    /// Redraws the whole terminal from the last screen the host-op stream
+    /// brought it to: publishes one `.hostBytes` repaint through that
+    /// stream, in order with the server's states, with no round trip. Heals
+    /// cells the terminal holds stale. No-op before the first state, and on
+    /// a session restored from a snapshot (it holds no screens). (Waycar
+    /// patch: client screen model.)
+    public func repaintScreen() {
+        guard hasDisplayedState, screensMatchTerminal else { return }
+        publishHostOps([.hostBytes(MoshScreenEncoder.fullRepaint(of: displayedScreen))])
+    }
+
     public func makeSnapshot() async throws -> MoshSnapshot {
         let runtimeSnapshot = await engine?.makeSnapshot() ?? pendingTransportSnapshot ?? TransportRuntimeSnapshot()
         let outboundSnapshots = pendingOutboundOrder.compactMap { stateNum in
@@ -559,6 +593,8 @@ public actor MoshClientSession {
         latestReceivedStateNum = blob.latestReceivedStateNum
         lastAckReportedNum = blob.lastAckReportedNum
         appliedRemoteStateNums = blob.appliedRemoteStateNums
+        // (Waycar patch) Snapshots carry no screens.
+        screensMatchTerminal = false
 
         let now = TransportClock.nowMs()
         pendingOutbound = Dictionary(
@@ -825,6 +861,10 @@ public actor MoshClientSession {
         lastServerContactAtMs
     }
 
+    func _testOlderBaseStateCount() -> Int {
+        olderBaseStateCount
+    }
+
     private func encodeUserDiff(from op: MoshClientOp) throws -> Data {
         switch op {
         case .keystrokes(let bytes):
@@ -875,6 +915,7 @@ public actor MoshClientSession {
         }
         if let throwaway = instruction.throwawayNum, throwaway > 0 {
             pruneAppliedRemoteStates(before: throwaway)
+            pruneScreens(before: throwaway) // (Waycar patch)
         }
 
         if let newNum = instruction.newNum {
@@ -891,14 +932,15 @@ public actor MoshClientSession {
                 reackRequested = true
                 return []
             }
-            // A base older than our latest state is applied on top of the
-            // newer screen, as upstream does. mosh-server falls back to our
-            // last acknowledged state whenever acks trail its patience, which
-            // is routine once round-trip time is a few hundred milliseconds;
-            // dropping those states until it re-bases measured ~1 frame/s and
-            // 3.5 s of lag at 250 ms RTT. The cost: a cell that changed and
-            // changed back between the base and this state can keep its
-            // intermediate content until redrawn (see PROVENANCE.md).
+            // (Waycar patch: client screen model) A base older than the
+            // displayed state is routine: mosh-server falls back to our last
+            // acknowledged state whenever acks trail its patience, which
+            // happens at a few hundred milliseconds of round-trip time. Its
+            // diff is right only on that base, so `trackState` applies it to
+            // the base's screen and repaints the terminal from the screen it
+            // shows. Dropping those states instead measured ~1 frame/s and
+            // 3.5 s of lag at 250 ms RTT; applying them on top of the newer
+            // screen, as upstream did, doubled scrolls and left stale cells.
             latestReceivedStateNum = max(latestReceivedStateNum, newNum)
             appliedRemoteStateNums.insert(newNum)
             if appliedRemoteStateNums.count > 4096 {
@@ -915,7 +957,21 @@ public actor MoshClientSession {
             }
         }
 
-        guard let diff = instruction.diff else {
+        let ops = hostOps(fromDiff: instruction.diff)
+        guard let newNum = instruction.newNum else {
+            // (Waycar patch) No state to file it under: shown as is, and
+            // the displayed screen follows the terminal.
+            displayedScreen.apply(ops)
+            return ops
+        }
+        return trackState(newNum: newNum, oldNum: instruction.oldNum, ops: ops)
+    }
+
+    /// A state's diff as host ops. An empty or missing diff means the new
+    /// state equals its base. Bytes that are not a HostMessage are passed
+    /// on raw, as upstream did.
+    private func hostOps(fromDiff diff: Data?) -> [MoshHostOp] {
+        guard let diff else {
             return []
         }
 
@@ -933,6 +989,68 @@ public actor MoshClientSession {
         }
 
         return [.hostBytes(diff)]
+    }
+
+    /// Builds state `newNum` from its base's screen and returns the host
+    /// ops that bring the terminal from the displayed state to it: the
+    /// server's own ops when the base is the displayed state, else a
+    /// repaint from the displayed screen (plus the size change and echo
+    /// acks). A base this client no longer holds, or a restored session,
+    /// gets the server's ops as upstream did, best effort, with the
+    /// displayed screen tracking what the terminal was sent. (Waycar patch:
+    /// client screen model.)
+    private func trackState(newNum: UInt64, oldNum: UInt64?, ops: [MoshHostOp]) -> [MoshHostOp] {
+        hasDisplayedState = true
+        defer { capScreens() }
+        guard screensMatchTerminal, let oldNum, let base = screens[oldNum] else {
+            displayedScreen.apply(ops)
+            displayedNum = newNum
+            screens[newNum] = displayedScreen
+            return ops
+        }
+        var next = base
+        next.apply(ops)
+        screens[newNum] = next
+        defer {
+            displayedScreen = next
+            displayedNum = newNum
+        }
+        if oldNum == displayedNum {
+            return ops
+        }
+        olderBaseStateCount += 1
+        if debugEnabled {
+            debugLog("state \(newNum) on older base \(oldNum) (displayed \(displayedNum)): repainting")
+        }
+        var repaint: [MoshHostOp] = []
+        if next.cols != displayedScreen.cols || next.rows != displayedScreen.rows {
+            repaint.append(.resize(cols: Int32(next.cols), rows: Int32(next.rows)))
+        }
+        repaint.append(.hostBytes(MoshScreenEncoder.encode(from: displayedScreen, to: next)))
+        repaint += ops.filter {
+            if case .echoAck = $0 { return true }
+            return false
+        }
+        return repaint
+    }
+
+    /// Drops screens the server will never build on again (below its
+    /// throwaway number), always keeping the displayed one. (Waycar patch.)
+    private func pruneScreens(before throwawayNum: UInt64) {
+        let displayed = displayedNum
+        let isStale = { (key: UInt64) in key < throwawayNum && key != displayed }
+        guard screens.keys.contains(where: isStale) else { return }
+        screens = screens.filter { !isStale($0.key) }
+    }
+
+    /// Evicts the oldest screens beyond `maxHeldScreens`, never the
+    /// displayed one. (Waycar patch.)
+    private func capScreens() {
+        guard screens.count > Self.maxHeldScreens else { return }
+        let evictable = screens.keys.filter { $0 != displayedNum }.sorted()
+        for key in evictable.prefix(screens.count - Self.maxHeldScreens) {
+            screens.removeValue(forKey: key)
+        }
     }
 
     private func instructionHasContent(_ instruction: TransportInstruction) -> Bool {
