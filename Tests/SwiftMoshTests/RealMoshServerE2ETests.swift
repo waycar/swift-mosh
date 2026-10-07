@@ -262,17 +262,44 @@ final class RealMoshServerE2ETests: XCTestCase {
     /// more older-base states than at 300 or 500 ms, where it slows down;
     /// upstream failed every measured run at 150 ms and some at 300 ms.
     func testRealMoshServerStatesOnOlderBasesLeaveTheTerminalRight() async throws {
+        let lineCount = 300
+        // The last 23 lines and the cursor's empty line below them.
+        try await runOlderBaseWorkload(
+            label: "older-base E2E",
+            command: "read go; i=1; while [ $i -le \(lineCount) ]; do echo \"line $i\"; i=$((i+1)); "
+                + "sleep 0.01; done; exec cat",
+            expected: ((lineCount - 22)...lineCount).map { "line \($0)" } + [""])
+    }
+
+    /// The same delayed uplink with omp's full-width status row (two 👁,
+    /// 1 column each by the Host's `wcwidth`, and 🌳) scrolling between
+    /// numbered lines. A model that counts 👁 as 2 columns autowraps each
+    /// such row and drifts. (Waycar patch 16, #148.)
+    func testRealMoshServerOlderBasesWithFullWidthSymbolRows() async throws {
+        let status = MoshTestScreens.ompStatusRow(cols: 80)
+        let lineCount = 300
+        // Rows alternate status, "line i"; the last 23 end with line 150.
+        var expected = ["line \(lineCount - 11)"]
+        for i in (lineCount - 10)...lineCount { expected += [status, "line \(i)"] }
+        expected.append("")
+        try await runOlderBaseWorkload(
+            label: "status-row E2E",
+            command: "read go; i=1; while [ $i -le \(lineCount) ]; do printf '%s\\n' '\(status)'; "
+                + "echo \"line $i\"; i=$((i+1)); sleep 0.01; done; exec cat",
+            expected: expected)
+    }
+
+    /// Runs `command` behind a 150 ms delayed uplink at 80×24 and checks the
+    /// terminal fed the session's host ops ends showing `expected`, and that
+    /// the server built states on older bases meanwhile.
+    private func runOlderBaseWorkload(label: String, command: String, expected: [String]) async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
             throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
         }
 
         let host = env["SWIFTMOSH_REAL_E2E_HOST"] ?? "127.0.0.1"
-        let lineCount = 300
-        let connect = try Self.launchLocalMoshServer(
-            environment: env,
-            command: "read go; i=1; while [ $i -le \(lineCount) ]; do echo \"line $i\"; i=$((i+1)); "
-                + "sleep 0.01; done; exec cat")
+        let connect = try Self.launchLocalMoshServer(environment: env, command: command)
         let serverPID = try XCTUnwrap(connect.serverPID, "mosh-server did not report its detached pid")
         defer {
             if Self.isAlive(serverPID) { _ = kill(serverPID, SIGKILL) }
@@ -297,8 +324,6 @@ final class RealMoshServerE2ETests: XCTestCase {
         try await session.enqueue(.resize(cols: 80, rows: 24))
         try await session.enqueue(.keystrokes(Data("go\r".utf8)))
 
-        // The last 23 lines and the cursor's empty line below them.
-        let expected = ((lineCount - 22)...lineCount).map { "line \($0)" } + [""]
         var display = MoshScreen(cols: 80, rows: 24)
         let deadline = Date().addingTimeInterval(25)
         while Date() < deadline {
@@ -314,7 +339,7 @@ final class RealMoshServerE2ETests: XCTestCase {
             wrongRows, 0,
             "rows wrong: \(wrongRows) of 24 (older-base states: \(olderBaseStates)); terminal shows \(display.rowTexts)")
         XCTAssertGreaterThan(olderBaseStates, 0, "the server must have built states on older bases")
-        print("[older-base E2E] older-base states: \(olderBaseStates), rows wrong: \(wrongRows) of 24")
+        print("[\(label)] older-base states: \(olderBaseStates), rows wrong: \(wrongRows) of 24")
     }
 
     /// The next server contact after `after`, or nil past `timeoutMs`.

@@ -141,6 +141,34 @@ final class MoshScreenSessionTests: XCTestCase {
         await link.close()
     }
 
+    /// omp's full-width status row (two 👁, 1 column each on the Host) on
+    /// screen while a state lands on an older base: the repaint from the
+    /// session's model shows the true state, not a row-shifted one.
+    func testStateOnAnOlderBaseWithAFullWidthStatusRow() async throws {
+        let link = try await makeLink()
+        let status = MoshTestScreens.ompStatusRow(cols: 59)
+
+        try await link.send(old: 0, new: 1, [
+            .resize(width: 59, height: 6),
+            .hostBytes(bytes(
+                "\u{1B}[r\u{1B}[0m\u{1B}[H\u{1B}[2Ja1\u{1B}[2;1Ha2\u{1B}[3;1Ha3"
+                    + "\u{1B}[4;1H" + status + "\r\nmodel 10\r\nprompt")),
+        ])
+        try await link.send(old: 1, new: 2, [
+            .hostBytes(bytes("\u{1B}[5;7H11\u{1B}[6;7H")),
+        ])
+        try await link.send(old: 1, new: 3, [
+            .hostBytes(bytes("\u{1B}[3;1Ha4\r\nX\u{1B}[5;8H2\u{1B}[6;7H")),
+        ])
+
+        let display = try await link.display(afterHostBytes: 3)
+        XCTAssertEqual(display.rowTexts, ["a1", "a2", "a4", "X" + status.dropFirst(), "model 12", "prompt"])
+        XCTAssertEqual(display.cursor.row, 5)
+        XCTAssertEqual(display.cursor.col, 6)
+
+        await link.close()
+    }
+
     /// `repaintScreen` publishes through the host-op stream between the
     /// server's states, and only at the displayed screen's size.
     func testRepaintScreenIsOrderedWithServerStates() async throws {

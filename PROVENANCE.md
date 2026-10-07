@@ -226,9 +226,17 @@ taken.
     clipboard again, and does nothing before the first state or on a
     restored session. The parser never traps: it ignores sequences outside
     the vocabulary, bounds resizes to 512×256, and bounds combining marks
-    and OSC strings. Character widths mirror a glibc-style `wcwidth` (the
-    Host's, which mosh-server lays out with) from the standard library's
-    Unicode properties, so no data files ship. `_testOlderBaseStateCount()`
+    and OSC strings. Character widths must equal the Host's `wcwidth`,
+    which mosh-server lays out with: wide (2) scalars come from
+    `MoshCharacterWidthTable`, generated from the Host libc's table (Darwin
+    `wcwidth`, en_US.UTF-8, East Asian Width W/F, the set glibc derives too)
+    by `Scripts/generate-character-widths.swift` (`--check` reports drift);
+    lookup is a binary search. Mn/Me/Cf (except U+00AD), U+200B and
+    U+1160–11FF are 0, as on glibc and Darwin. One known divergence: Darwin
+    zeroes Mc spacing marks, glibc gives them 1, and so does the model.
+    (A hand-made emoji range once counted 👁 as 2 columns; omp's status row
+    then autowrapped the model and every later row drifted, #148.)
+    `_testOlderBaseStateCount()`
     is a Waycar test hook (the real-server suite asserts older-base states
     arrived); re-vendoring must keep it.
 

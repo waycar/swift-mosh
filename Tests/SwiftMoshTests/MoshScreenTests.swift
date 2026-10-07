@@ -161,7 +161,64 @@ final class MoshScreenTests: XCTestCase {
         XCTAssertEqual(MoshCharacterWidth.columns(of: "⌚"), 2)
         XCTAssertEqual(MoshCharacterWidth.columns(of: "─"), 1)
         XCTAssertEqual(MoshCharacterWidth.columns(of: "❯"), 1)
+        // The Host's wcwidth, as in omp's status row.
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{1F441}"), 1, "👁 is text presentation")
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{1F333}"), 2, "🌳")
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "⏳"), 2)
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{1F1E6}"), 1, "regional indicator")
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{3248}"), 1)
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{17000}"), 2, "Tangut")
+        for narrow: Unicode.Scalar in ["◕", "▶", "⠼", "⑂", "─", "╭", "╮"] {
+            XCTAssertEqual(MoshCharacterWidth.columns(of: narrow), 1, "\(narrow)")
+        }
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{FE0F}"), 0)
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{FE0E}"), 0)
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{903}"), 1, "Mc stays 1, as in glibc")
     }
+
+    /// omp's full-width status row has two 👁, which the Host lays out as 1
+    /// column each. A model that counts 2 autowraps the row early and every
+    /// later row lands one row low.
+    func testFullWidthStatusRowWithTextPresentationSymbolsKeepsRowsAligned() {
+        let status = MoshTestScreens.ompStatusRow(cols: 59)
+        var screen = MoshScreen(cols: 59, rows: 5)
+        screen.apply(bytes("\u{1B}[H\u{1B}[2Jtop\u{1B}[3;1H" + status + "\r\nnext row\r\nprompt"))
+        XCTAssertEqual(screen.rowTexts, ["top", "", status, "next row", "prompt"])
+        XCTAssertFalse(screen.lines[2].softWrapped, "the status row fits the width exactly")
+        XCTAssertEqual(screen.cursor, .init(row: 4, col: 6))
+    }
+
+    #if os(macOS)
+    /// Pins the generator contract: the generated table and the zero-width
+    /// rules equal Darwin `wcwidth` (en_US.UTF-8), the Host libc.
+    func testWidthsMatchTheHostWcwidth() throws {
+        let previous = setlocale(LC_CTYPE, nil).map { String(cString: $0) } ?? "C"
+        try XCTUnwrap(setlocale(LC_CTYPE, "en_US.UTF-8"), "en_US.UTF-8 locale unavailable")
+        defer { setlocale(LC_CTYPE, previous) }
+        var values = Set(stride(from: UInt32(0x300), through: 0x10FFFF, by: 7))
+        let listed: [ClosedRange<UInt32>] = [
+            0x1F441...0x1F441, 0x1F321...0x1F32C, 0x1F336...0x1F336, 0x1F37D...0x1F37D,
+            0x1F394...0x1F39F, 0x1F3CB...0x1F3CE, 0x1F43F...0x1F43F, 0x1F4FD...0x1F4FE,
+            0x1F53E...0x1F54A, 0x1F568...0x1F579, 0x1F57B...0x1F594, 0x1F597...0x1F5A3,
+            0x1F5A5...0x1F5FA, 0x1F900...0x1F90B, 0x1F1E6...0x1F1FF, 0x3248...0x324F,
+            0x16FE0...0x16FFF, 0x17000...0x187F7, 0x18800...0x18CD5, 0x18D00...0x18D08,
+            0x1AFF0...0x1AFFE, 0x1B000...0x1B2FB, 0x1F200...0x1F265, 0x1F300...0x1F64F,
+            0x1F900...0x1F9FF, 0xFE0E...0xFE0F, 0x200B...0x200D,
+        ]
+        for range in listed { values.formUnion(range) }
+        var mismatches: [String] = []
+        for value in values.sorted() {
+            guard let scalar = Unicode.Scalar(value) else { continue }
+            let host = Int(wcwidth(wchar_t(value)))
+            guard host >= 0 else { continue }  // unassigned or control
+            // The one documented divergence: Darwin zeroes Mc, glibc and we give 1.
+            if host == 0, scalar.properties.generalCategory == .spacingMark { continue }
+            let ours = MoshCharacterWidth.columns(of: scalar)
+            if ours != host { mismatches.append("U+\(String(value, radix: 16, uppercase: true)) ours \(ours) host \(host)") }
+        }
+        XCTAssertEqual(mismatches.count, 0, "\(mismatches.prefix(20))")
+    }
+    #endif
 
     func testSelectGraphicRenditionForms() {
         var screen = MoshScreen(cols: 4, rows: 1)
@@ -464,5 +521,14 @@ struct SeededGenerator: RandomNumberGenerator {
         value = (value ^ (value >> 30)) &* 0xBF58_476D_1CE4_E5B9
         value = (value ^ (value >> 27)) &* 0x94D0_49BB_1331_11EB
         return value ^ (value >> 31)
+    }
+}
+
+/// Screens shared by the screen model and session tests.
+enum MoshTestScreens {
+    /// omp's status row, `cols` wide by the Host's `wcwidth` (each 👁 is 1).
+    static func ompStatusRow(cols: Int) -> String {
+        let head = "╭── ⠼ ◕ \u{1F441} \u{1F333} ⑂ \u{1F441} ▶"  // 18 columns
+        return head + String(repeating: "─", count: cols - 19) + "╮"
     }
 }
