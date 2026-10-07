@@ -192,36 +192,45 @@ taken.
     after the send let a rebind or contact check re-send the old size as a
     later state, leaving the server's terminal at the size the client left.
 16. **Client screen model** (`MoshScreen`, `MoshScreenEncoder`,
-    `MoshCharacterWidth`, `MoshClientSession.repaintScreen()`). Written
-    clean-room from ECMA-48 / xterm semantics and the bytes mosh-server 1.4.0
-    was observed to send; mosh's (GPL) source was not consulted. Every server
-    state is a diff that turns its base state's screen into the new one,
-    skipping cells the two share and scrolling with LF. When acks trail the
-    server's patience it builds on the client's last acknowledged state,
-    older than the screen already shown; upstream applied those diffs on top
-    of the newer screen, which ran scrolls twice and left stale cells that
-    the server, believing the screen right, never redrew. The session now
-    keeps a screen per recent state (state 0 is a blank 80×24, pruned on the
-    server's throwaway number, capped at 256, the displayed state always
-    kept) and applies each state's host message (resize, then bytes) to a
-    copy of its base's screen. A state on the displayed base publishes the
-    server's ops unchanged; one on an older base publishes a repaint from
-    the displayed screen to the new one instead (the size change if any, a
-    replayed upward scroll so Ghostty keeps its scrollback, then only the
-    rows that differ, the modes, titles, a changed clipboard, the cursor and
-    the current rendition), plus its echo acks. An empty diff on an older
-    base returns the screen to that base. A base no longer held, or any
-    state on a session restored from a snapshot (snapshots carry no
-    screens), is passed through as upstream did, the displayed screen
-    tracking what the terminal was sent. `repaintScreen()` publishes a full
-    repaint of the displayed screen through the host-op stream, in order
-    and with no round trip; it never clears (Ghostty would push the screen
-    into scrollback) or sets the clipboard again, and does nothing before
-    the first state or on a restored session. The parser never traps: it
-    ignores sequences outside the vocabulary and bounds resizes, combining
-    marks and OSC strings. Character widths mirror a glibc-style `wcwidth`
-    (the Host's, which mosh-server lays out with) from the standard
-    library's Unicode properties, so no data files ship.
+    `MoshCharacterWidth`, `MoshClientSession.repaintScreen(cols:rows:)`).
+    Written clean-room from ECMA-48 / xterm semantics and the bytes
+    mosh-server 1.4.0 was observed to send; mosh's (GPL) source was not
+    consulted. Every server state is a diff that turns its base state's
+    screen into the new one, skipping cells the two share and scrolling with
+    LF. When acks trail the server's patience it builds on the client's last
+    acknowledged state, older than the screen already shown; upstream
+    applied those diffs on top of the newer screen, which ran scrolls twice
+    and left stale cells that the server, believing the screen right, never
+    redrew. The session now keeps a screen per recent state (state 0 is a
+    blank 80×24) and applies each state's host message (resize, then bytes)
+    to a copy of its base's screen. Screens below the server's throwaway
+    number are dropped; beyond 256 screens or 4M cells (rows × columns,
+    summed) the oldest are evicted, but never the displayed one nor the
+    oldest held one, which is the server's fallback base. A state on the
+    displayed base publishes the server's ops unchanged; one on an older
+    base publishes a repaint from the displayed screen to the new one
+    instead (the size change if any, a replayed upward scroll so Ghostty
+    keeps its scrollback, then only the rows that differ, the modes, titles,
+    a changed clipboard, the cursor and the current rendition), plus its
+    echo acks. Scroll detection compares rows by hash and tries only the
+    distances the target's first few rows suggest; rows are then compared
+    exactly, so a missed scroll costs bytes, not correctness. An empty diff
+    on an older base returns the screen to that base. A base no longer
+    held, or any state on a session restored from a snapshot (snapshots
+    carry no screens), is passed through as upstream did, the displayed
+    screen tracking what the terminal was sent. `repaintScreen(cols:rows:)`
+    publishes a full repaint of the displayed screen through the host-op
+    stream, in order and with no round trip, when that screen has the given
+    size (at another size the server's state for the new size repaints); it
+    never clears (Ghostty would push the screen into scrollback) or sets the
+    clipboard again, and does nothing before the first state or on a
+    restored session. The parser never traps: it ignores sequences outside
+    the vocabulary, bounds resizes to 512×256, and bounds combining marks
+    and OSC strings. Character widths mirror a glibc-style `wcwidth` (the
+    Host's, which mosh-server lays out with) from the standard library's
+    Unicode properties, so no data files ship. `_testOlderBaseStateCount()`
+    is a Waycar test hook (the real-server suite asserts older-base states
+    arrived); re-vendoring must keep it.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
@@ -271,34 +280,44 @@ tens of milliseconds. The real-server suite also proves an idle mosh-server
 answers the elicited state well inside its 3 s ack interval.
 
 `Tests/SwiftMoshTests/MoshScreenTests.swift` covers patch 16's parser with
-hand-written expectations (cursor moves, CR/LF/BS, LF scrolling the screen
-and a DECSTBM region, erases with the current background, autowrap and
-soft-wrap, wide characters and half overwrites, combining marks, character
-widths, SGR forms, OSC titles and clipboard with BEL and ST, modes, resize,
-garbage input) and its encoder by seeded random round trips: a screen fed
-the bytes encoded towards a related screen, an unrelated one or one of
-another size renders equal to it, and a full repaint paints over an
-unrelated screen. `MoshScreenSessionTests.swift` feeds every published op
-into a terminal model: a state built on base 1 after state 2 leaves it
-showing that state (upstream: 3 of 5 rows wrong, a line doubled), an empty
-state on an older base returns it to that base (upstream: kept the newer
-text), and `repaintScreen()` repaints a stale terminal and does nothing
-before the first state. The real-server suite runs 300 numbered lines with
-every client datagram sent 300 ms late, so mosh-server builds 26–35 states
-on older bases; the terminal ends exact (upstream: 4 and 10 of 24 rows
-wrong). Two upstream tests in `MoshProtocolE2ETests` assumed every diff
-applies on top of the last: `testServerSendsMultipleStatesBeforeClientAcks`
-now checks the terminal shows the last state, and the echo server in
-`testRapidKeystrokeEchoRoundTrip` sends each diff against its base.
+hand-written expectations (cursor moves, CR/LF/BS including BS with a wrap
+pending, LF scrolling the screen and a DECSTBM region, erases with the
+current background, autowrap and soft-wrap, wide characters, half
+overwrites and a wide character wrapping off a full row, combining marks,
+character widths, SGR forms, OSC titles and clipboard with BEL and ST,
+modes, unknown sequences, resize, garbage input) and its encoder by seeded
+random round trips: a screen fed the bytes encoded towards a related
+screen, an unrelated one or one of another size renders equal to it, and a
+full repaint paints over an unrelated screen; plus scroll replay, a region
+scroll above a fixed footer, soft-wrap continuation, and the cell after a
+wide character staying put when the terminal measures it narrow.
+`MoshScreenSessionTests.swift` feeds every published op into a terminal
+model; against upstream each case fails: a state built on base 1 after
+state 2 (upstream: 3 of 5 rows wrong, a line doubled), a cell the older-base
+diff skips (upstream: "count 21" for "count 20"), an empty state on an older
+base (upstream: keeps the newer text), the throwaway state kept as a base
+(fails if pruning drops it), an older base across a resize (upstream: keeps
+the 30×6 screen), and a region scroll above a changing status row
+(upstream: the region scrolled three times, "status 21"); `repaintScreen`
+publishes between the server's states and nothing before the first state or
+at another size. The real-server suite runs 300 numbered lines with every
+client datagram sent 150 ms late, so mosh-server builds 65–73 states on
+older bases; the terminal ends exact (upstream: 11–18 of 24 rows wrong over
+four runs). Three upstream tests in `MoshProtocolE2ETests` assumed every
+diff applies on top of the last: `testServerSendsMultipleStatesBeforeClientAcks`
+now checks the terminal shows the last state, and the simulated servers in
+`testInitialConnectionDoesNotBlackScreen` and
+`testRapidKeystrokeEchoRoundTrip` send each diff against its base.
 
 ## Known limitations
 
 - **A base the client no longer holds is applied on top of the displayed
-  screen** (upstream's rule): after the 256-screen cap evicts it, or on a
+  screen** (upstream's rule): after the screen or cell cap evicts it, or on a
   session restored from a snapshot, which carries no screens. A cell can then
   keep stale content until something redraws it. The app never restores a
-  session from a snapshot, and mosh-server's throwaway number keeps the held
-  screens far below the cap.
+  session from a snapshot, mosh-server's throwaway number keeps the held
+  screens far below the caps, and the server's fallback base (the oldest
+  held) is never evicted.
 - **The screen model follows the server's vocabulary only.** Sequences
   outside it (see patch 16) are ignored; a Host whose `wcwidth` disagrees
   with `MoshCharacterWidth`, or a Ghostty that measures a character

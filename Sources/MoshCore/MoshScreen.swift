@@ -96,8 +96,8 @@ struct MoshScreen: Sendable {
     }
 
     /// Bounds a hostile or garbled resize to an allocation the device holds.
-    static let maxColumns = 2048
-    static let maxRows = 1024
+    static let maxColumns = 512
+    static let maxRows = 256
     /// Bounds the combining scalars one cell collects.
     static let maxScalarsPerCell = 16
     /// Bounds an OSC string (titles, clipboard) the parser collects.
@@ -183,9 +183,9 @@ struct MoshScreen: Sendable {
         }
     }
 
-    /// Resizes the grid as mosh-server's framebuffer does: keeps the
-    /// top-left content, pads or truncates, clamps the cursor and resets
-    /// the scroll region.
+    /// Resizes the grid the way mosh-server's resized states were observed
+    /// to assume: keeps the top-left content, pads or truncates, clamps the
+    /// cursor and resets the scroll region.
     mutating func resize(cols newCols: Int, rows newRows: Int) {
         let newCols = min(max(newCols, 1), Self.maxColumns)
         let newRows = min(max(newRows, 1), Self.maxRows)
@@ -338,15 +338,17 @@ struct MoshScreen: Sendable {
         Row(cols: cols, fill: erasedCell)
     }
 
+    /// Leaves cells that already hold the erased blank untouched, so an
+    /// erase that changes nothing copies no shared row.
     private mutating func erase(row: Int, columns: Range<Int>) {
         let columns = columns.clamped(to: 0..<cols)
         guard !columns.isEmpty else { return }
         clearWideFragments(row: row, columns: columns)
         let blank = erasedCell
-        for col in columns {
+        for col in columns where lines[row].cells[col] != blank {
             lines[row].cells[col] = blank
         }
-        if columns.upperBound == cols {
+        if columns.upperBound == cols, lines[row].softWrapped {
             lines[row].softWrapped = false
         }
     }
@@ -384,12 +386,11 @@ struct MoshScreen: Sendable {
         case 0x07:
             bellCount &+= 1
         case 0x08:
-            // With a wrap pending, BS only cancels it, as in Ghostty.
-            if cursor.pendingWrap {
-                cursor.pendingWrap = false
-            } else {
-                cursor.col = max(0, cursor.col - 1)
-            }
+            // BS moves left and cancels a pending wrap, as in xterm and
+            // Ghostty: after printing in the last column it lands one
+            // column left of it.
+            cursor.col = max(0, cursor.col - 1)
+            cursor.pendingWrap = false
         case 0x09:
             cursor.col = min(cols - 1, (cursor.col / 8 + 1) * 8)
             cursor.pendingWrap = false

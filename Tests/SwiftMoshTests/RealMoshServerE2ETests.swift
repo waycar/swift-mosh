@@ -255,10 +255,12 @@ final class RealMoshServerE2ETests: XCTestCase {
     }
 
     /// With acks trailing mosh-server's patience (here every client datagram
-    /// leaves 300 ms late) the server builds states on the client's last
+    /// leaves 150 ms late) the server builds states on the client's last
     /// acknowledged state, older than the screen already shown. The
     /// terminal fed the session's host ops must still end up showing the
-    /// server's screen. (Waycar patch 16.)
+    /// server's screen. (Waycar patch 16.) At 150 ms the server sends many
+    /// more older-base states than at 300 or 500 ms, where it slows down;
+    /// upstream failed every measured run at 150 ms and some at 300 ms.
     func testRealMoshServerStatesOnOlderBasesLeaveTheTerminalRight() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
@@ -276,8 +278,9 @@ final class RealMoshServerE2ETests: XCTestCase {
             if Self.isAlive(serverPID) { _ = kill(serverPID, SIGKILL) }
         }
 
-        var config = MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
-        config.ackDelayMs = 600
+        // The client acks each state as it applies it, so `ackDelayMs` does
+        // not hold acks back; the delayed endpoint does.
+        let config = MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
         let session = MoshClientSession(
             endpoint: MoshEndpoint(host: host, port: connect.port, keyBase64_22: connect.key),
             config: config,
@@ -286,7 +289,7 @@ final class RealMoshServerE2ETests: XCTestCase {
                     inner: NetworkDatagramEndpoint(
                         remote: UDPTransportEndpointAddress(host: endpoint.host, port: endpoint.port),
                         localPort: config.localPort),
-                    delayMs: 300)
+                    delayMs: 150)
             },
             snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
         )

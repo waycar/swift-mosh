@@ -139,17 +139,21 @@ final class MoshProtocolE2ETests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000) // 5ms between sends
         }
 
-        // Give client time to process
-        try await Task.sleep(nanoseconds: 100_000_000)
-
-        // Drain all received host ops
-        let ops = await session.drainHostOps()
+        // Collect host ops until all 5 states arrived (at most 2 s)
+        var ops: [MoshHostOp] = []
+        var hostBytesCount = 0
+        let deadline = Date().addingTimeInterval(2)
+        while hostBytesCount < 5, Date() < deadline {
+            let drained = await session.drainHostOps()
+            ops += drained
+            hostBytesCount += drained.filter {
+                if case .hostBytes = $0 { return true }
+                return false
+            }.count
+            if hostBytesCount < 5 { try await Task.sleep(nanoseconds: 10_000_000) }
+        }
         var display = MoshScreen(cols: 80, rows: 24)
         display.apply(ops)
-        let hostBytesCount = ops.filter {
-            if case .hostBytes = $0 { return true }
-            return false
-        }.count
 
         // The client MUST have received all 5 state updates
         // With the strict matching bug, only the first would be received
@@ -161,7 +165,9 @@ final class MoshProtocolE2ETests: XCTestCase {
 
     /// Simulates the real connection flow: client sends resize, then server
     /// sends multiple rapid updates (shell prompt, MOTD, etc.) all based on
-    /// oldNum=0 since the client hasn't acked yet.
+    /// oldNum=0 since the client hasn't acked yet. As a real server's, each
+    /// diff turns state 0 into its state, so it repeats the output before it.
+    /// (Waycar patch 16: the diffs used to carry only the new output.)
     func testInitialConnectionDoesNotBlackScreen() async throws {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
         let key = Data(repeating: 0x42, count: 16)
@@ -199,8 +205,9 @@ final class MoshProtocolE2ETests: XCTestCase {
             "Last login: Mon Mar 17 12:00:00 2026\r\n",
             "user@host:~$ ",
         ]
-        for (i, output) in serverOutputs.enumerated() {
-            let hostMsg = HostMessage(instructions: [.hostBytes(Data(output.utf8))])
+        for i in serverOutputs.indices {
+            let cumulative = serverOutputs[...i].joined()
+            let hostMsg = HostMessage(instructions: [.hostBytes(Data(cumulative.utf8))])
             let instruction = TransportInstruction(
                 protocolVersion: 2, oldNum: 0, newNum: UInt64(i + 1),
                 ackNum: 1, throwawayNum: 0,
@@ -210,23 +217,22 @@ final class MoshProtocolE2ETests: XCTestCase {
             try await serverEngine.sendPayload(payload)
         }
 
-        // Collect output via stream within 500ms
-        var collected = Data()
+        // Feed the output into a terminal within 500ms
+        var display = MoshScreen(cols: 80, rows: 24)
         let deadline = Date().addingTimeInterval(0.5)
         while Date() < deadline {
-            let drained = await session.drainHostOps()
-            for op in drained {
-                if case .hostBytes(let bytes) = op { collected.append(bytes) }
-            }
-            if collected.count > 0 && String(data: collected, encoding: .utf8)?.contains("user@host") == true {
+            display.apply(await session.drainHostOps())
+            if display.text(ofRow: 2) == "user@host:~$" {
                 break
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
 
-        let output = String(data: collected, encoding: .utf8) ?? ""
-        XCTAssertTrue(output.contains("Welcome"), "Must see MOTD, got: \(output)")
-        XCTAssertTrue(output.contains("user@host"), "Must see prompt, got: \(output)")
+        XCTAssertEqual(
+            Array(display.rowTexts.prefix(4)),
+            ["Welcome to Ubuntu 22.04", "Last login: Mon Mar 17 12:00:00 2026", "user@host:~$", ""],
+            "Must see MOTD and prompt once each")
+        XCTAssertEqual(display.cursor, .init(row: 2, col: 13))
 
         await session.stop()
     }

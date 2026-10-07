@@ -106,9 +106,10 @@ public actor MoshClientSession {
     /// Recent server states as screens, by state number, for applying each
     /// diff to its stated base. State 0 is mosh-server's initial screen: a
     /// blank 80×24 (the first state resizes and repaints whenever the real
-    /// size differs). Pruned on the server's throwaway number and capped at
-    /// `maxHeldScreens`; the displayed state is always kept. (Waycar patch:
-    /// client screen model.)
+    /// size differs). Pruned on the server's throwaway number and bounded by
+    /// `maxHeldScreens` and `maxHeldCells`, never evicting the displayed
+    /// state or the oldest held one (the server's fallback base). (Waycar
+    /// patch: client screen model.)
     private var screens: [UInt64: MoshScreen] = [0: MoshScreen(cols: 80, rows: 24)]
     /// The state whose screen the host-op stream last brought the terminal
     /// to, and that screen. (Waycar patch.)
@@ -125,6 +126,10 @@ public actor MoshClientSession {
     /// (Waycar patch.)
     private var olderBaseStateCount = 0
     private static let maxHeldScreens = 256
+    /// The most cells (rows × columns, summed over held screens) kept: about
+    /// thirty screens of the largest size `MoshScreen` accepts. Rows shared
+    /// between screens count once per screen, so memory stays below this.
+    private static let maxHeldCells = 4_000_000
 
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
 
@@ -496,11 +501,15 @@ public actor MoshClientSession {
     /// Redraws the whole terminal from the last screen the host-op stream
     /// brought it to: publishes one `.hostBytes` repaint through that
     /// stream, in order with the server's states, with no round trip. Heals
-    /// cells the terminal holds stale. No-op before the first state, and on
-    /// a session restored from a snapshot (it holds no screens). (Waycar
-    /// patch: client screen model.)
-    public func repaintScreen() {
-        guard hasDisplayedState, screensMatchTerminal else { return }
+    /// cells the terminal holds stale. Only when that screen is
+    /// `cols`×`rows`, the terminal's size: at another size the server's
+    /// state for the new size repaints instead. No-op before the first
+    /// state, and on a session restored from a snapshot (it holds no
+    /// screens). (Waycar patch: client screen model.)
+    public func repaintScreen(cols: Int, rows: Int) {
+        guard hasDisplayedState, screensMatchTerminal,
+              displayedScreen.cols == cols, displayedScreen.rows == rows
+        else { return }
         publishHostOps([.hostBytes(MoshScreenEncoder.fullRepaint(of: displayedScreen))])
     }
 
@@ -1043,13 +1052,19 @@ public actor MoshClientSession {
         screens = screens.filter { !isStale($0.key) }
     }
 
-    /// Evicts the oldest screens beyond `maxHeldScreens`, never the
-    /// displayed one. (Waycar patch.)
+    /// Evicts the oldest screens while more than `maxHeldScreens` or
+    /// `maxHeldCells` are held. Never the displayed screen, nor the oldest
+    /// held one: mosh-server falls back to its last acknowledged state,
+    /// which is the oldest it has not thrown away. (Waycar patch.)
     private func capScreens() {
-        guard screens.count > Self.maxHeldScreens else { return }
-        let evictable = screens.keys.filter { $0 != displayedNum }.sorted()
-        for key in evictable.prefix(screens.count - Self.maxHeldScreens) {
-            screens.removeValue(forKey: key)
+        var cells = screens.values.reduce(0) { $0 + $1.cols * $1.rows }
+        guard screens.count > Self.maxHeldScreens || cells > Self.maxHeldCells else { return }
+        let ordered = screens.keys.sorted()
+        for key in ordered.dropFirst() where key != displayedNum {
+            guard screens.count > Self.maxHeldScreens || cells > Self.maxHeldCells else { return }
+            if let evicted = screens.removeValue(forKey: key) {
+                cells -= evicted.cols * evicted.rows
+            }
         }
     }
 

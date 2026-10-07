@@ -49,8 +49,18 @@ enum MoshScreenEncoder {
 
     // MARK: - Scroll
 
+    /// Target rows whose positions in `displayed` propose a scroll distance.
+    private static let scrollProbeRows = 4
+    /// The most scroll distances tried.
+    private static let maxScrollCandidates = 16
+
     /// Appends the upward scroll that best maps `displayed` onto `target`,
-    /// if it saves more rows than rewriting in place.
+    /// if it saves more rows than rewriting in place. An optimization only:
+    /// `writeRows` compares rows exactly afterwards, so a poor or missed
+    /// scroll costs bytes, never correctness. Rows are compared by hash, and
+    /// only the distances at which one of the target's first few non-blank
+    /// rows appears lower in `displayed` are tried, so the cost stays
+    /// linear in the screen; the winner is confirmed with exact compares.
     private static func appendScroll(
         from displayed: MoshScreen, to target: MoshScreen, into writer: inout Writer
     ) {
@@ -63,30 +73,55 @@ enum MoshScreenEncoder {
         let blankRow = MoshScreen.Row(cols: target.cols).cells
         let targetIsBlank = targetLines.map { $0.cells == blankRow }
 
-        func matches(_ targetRow: Int, _ shownRow: Int) -> Bool {
-            targetHashes[targetRow] == shownHashes[shownRow]
-                && targetLines[targetRow].cells == shownLines[shownRow].cells
+        /// Rows that match after scrolling rows `0...bottom` up by `shift`
+        /// (0: in place), counting only non-blank target rows.
+        func saved(shift: Int, bottom: Int, exact: Bool) -> Int {
+            func matches(_ targetRow: Int, _ shownRow: Int) -> Bool {
+                guard !targetIsBlank[targetRow], targetHashes[targetRow] == shownHashes[shownRow] else {
+                    return false
+                }
+                return !exact || targetLines[targetRow].cells == shownLines[shownRow].cells
+            }
+            var count = 0
+            for row in 0...(bottom - shift) where matches(row, row + shift) { count += 1 }
+            for row in (bottom + 1)..<rows where matches(row, row) { count += 1 }
+            return count
         }
 
-        guard let lastDifferent = (0..<rows).last(where: { !matches($0, $0) }) else { return }
-        let inPlace = (0..<rows).filter { !targetIsBlank[$0] && matches($0, $0) }.count
+        guard let lastDifferent = (0..<rows).last(where: { targetHashes[$0] != shownHashes[$0] }) else {
+            return
+        }
 
+        var shownRowsByHash: [Int: [Int]] = [:]
+        for (row, hash) in shownHashes.enumerated() {
+            shownRowsByHash[hash, default: []].append(row)
+        }
+        var shifts: [Int] = []
+        var probedHashes: Set<Int> = []
+        probing: for row in 0..<rows where !targetIsBlank[row] {
+            guard probedHashes.insert(targetHashes[row]).inserted else { continue }
+            for shownRow in shownRowsByHash[targetHashes[row], default: []] where shownRow > row {
+                if !shifts.contains(shownRow - row) { shifts.append(shownRow - row) }
+                if shifts.count == Self.maxScrollCandidates { break probing }
+            }
+            if probedHashes.count == Self.scrollProbeRows { break }
+        }
+
+        let inPlace = saved(shift: 0, bottom: rows - 1, exact: false)
         var best: (saved: Int, shift: Int, bottom: Int)?
         let bottoms = lastDifferent == rows - 1 ? [rows - 1] : [rows - 1, lastDifferent]
-        for bottom in bottoms where bottom >= 1 {
-            // Rows below a region stay put; count those that already match.
-            let kept = ((bottom + 1)..<rows).filter { !targetIsBlank[$0] && matches($0, $0) }.count
-            for shift in 1...bottom {
-                var saved = kept
-                for row in 0...(bottom - shift) where !targetIsBlank[row] && matches(row, row + shift) {
-                    saved += 1
-                }
-                if saved > (best?.saved ?? inPlace) {
-                    best = (saved, shift, bottom)
+        for bottom in bottoms {
+            for shift in shifts where shift <= bottom {
+                let count = saved(shift: shift, bottom: bottom, exact: false)
+                if count > (best?.saved ?? inPlace) {
+                    best = (count, shift, bottom)
                 }
             }
         }
-        guard let best else { return }
+        guard let best,
+              saved(shift: best.shift, bottom: best.bottom, exact: true)
+                > saved(shift: 0, bottom: rows - 1, exact: true)
+        else { return }
 
         // Scrolled-in lines take the current background: make it default.
         writer.setStyle(.plain)

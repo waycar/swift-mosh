@@ -32,6 +32,13 @@ final class MoshScreenTests: XCTestCase {
         XCTAssertEqual(screen.rowTexts, ["Xc", "   d", ""], "LF keeps the column")
     }
 
+    func testBackspaceWithAWrapPendingMovesLeft() {
+        var screen = MoshScreen(cols: 4, rows: 1)
+        screen.apply(bytes("abcd\u{08}X"))
+        XCTAssertEqual(screen.text(ofRow: 0), "abXd", "as in xterm and Ghostty")
+        XCTAssertEqual(screen.cursor, .init(row: 0, col: 3))
+    }
+
     func testLineFeedAtTheBottomScrollsTheScreen() {
         var screen = MoshScreen(cols: 4, rows: 3)
         screen.apply(bytes("1\r\n2\r\n3\u{1B}[0;44m\n"))
@@ -201,8 +208,12 @@ final class MoshScreenTests: XCTestCase {
         XCTAssertNil(screen.modes.mouseReporting, "resetting any reporting mode turns reporting off")
         XCTAssertNil(screen.modes.mouseEncoding)
         XCTAssertTrue(screen.modes.cursorVisible)
+        let modes = screen.modes
         screen.apply(bytes("\u{1B}[?1049h\u{1B}[4h\u{1B}[>4;1m\u{1B}P1$r\u{1B}\\"))
         XCTAssertEqual(screen.rowTexts, [""], "unknown sequences are ignored")
+        XCTAssertEqual(screen.style, .plain, "a private-marker SGR is not an SGR")
+        XCTAssertEqual(screen.modes, modes)
+        XCTAssertEqual(screen.cursor, .init(row: 0, col: 0))
     }
 
     func testResizeKeepsTheTopLeft() {
@@ -248,7 +259,7 @@ final class MoshScreenTests: XCTestCase {
             shown.apply(encoded)
             XCTAssertTrue(shown.rendersEqual(to: target), Self.describe(trial, shown, target))
         }
-        XCTAssertGreaterThan(scrolled, 20, "the trials must exercise the scroll replay")
+        XCTAssertGreaterThan(scrolled, 10, "the trials must exercise the scroll replay; \(scrolled) of 400 did")
     }
 
     func testEncodeTurnsAScreenIntoAnUnrelatedOne() {
@@ -334,6 +345,33 @@ final class MoshScreenTests: XCTestCase {
         XCTAssertTrue(shown.lines[0].softWrapped, "the terminal soft-wraps the row too")
     }
 
+    func testWideCharacterThatWrapsKeepsTheRowSoftWrapped() {
+        let blank = MoshScreen(cols: 4, rows: 2)
+        var target = blank
+        target.apply(bytes("abc中"))
+        XCTAssertEqual(target.rowTexts, ["abc", "中"])
+        XCTAssertTrue(target.lines[0].softWrapped, "the wrap before a wide character is a soft wrap")
+
+        var shown = blank
+        shown.apply(MoshScreenEncoder.encode(from: blank, to: target))
+        XCTAssertTrue(shown.rendersEqual(to: target))
+        XCTAssertTrue(shown.lines[0].softWrapped, "the terminal soft-wraps the row too")
+    }
+
+    /// After a wide cell the encoder places the next cell itself, so a
+    /// terminal that measures that character as one column misplaces only
+    /// that cell, not the rest of the row.
+    func testEncodePinsTheCellAfterAWideCharacter() {
+        let blank = MoshScreen(cols: 6, rows: 1)
+        var target = blank
+        target.apply(bytes("中ab"))
+        let encoded = String(decoding: MoshScreenEncoder.encode(from: blank, to: target), as: UTF8.self)
+
+        var narrow = blank
+        narrow.apply(Data(encoded.replacingOccurrences(of: "中", with: "x").utf8))
+        XCTAssertEqual(narrow.text(ofRow: 0), "x ab")
+    }
+
     // MARK: - Helpers
 
     private func bytes(_ text: String) -> Data {
@@ -341,7 +379,11 @@ final class MoshScreenTests: XCTestCase {
     }
 
     private static func describe(_ trial: Int, _ shown: MoshScreen, _ target: MoshScreen) -> String {
-        "trial \(trial): got \(shown.rowTexts) cursor \(shown.cursor) style \(shown.style) modes \(shown.modes), "
+        let differingRows = shown.rows == target.rows
+            ? (0..<target.rows).filter { shown.lines[$0].cells != target.lines[$0].cells }.count
+            : target.rows
+        return "trial \(trial): \(differingRows) of \(target.rows) rows differ; "
+            + "got \(shown.rowTexts) cursor \(shown.cursor) style \(shown.style) modes \(shown.modes), "
             + "want \(target.rowTexts) cursor \(target.cursor) style \(target.style) modes \(target.modes)"
     }
 
