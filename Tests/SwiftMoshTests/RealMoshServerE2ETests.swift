@@ -278,7 +278,7 @@ final class RealMoshServerE2ETests: XCTestCase {
     func testRealMoshServerOlderBasesWithFullWidthSymbolRows() async throws {
         let status = MoshTestScreens.ompStatusRow(cols: 80)
         let lineCount = 300
-        // Rows alternate status, "line i"; the last 23 end with line 150.
+        // Rows alternate status, "line i"; the last 23 end with line 300.
         var expected = ["line \(lineCount - 11)"]
         for i in (lineCount - 10)...lineCount { expected += [status, "line \(i)"] }
         expected.append("")

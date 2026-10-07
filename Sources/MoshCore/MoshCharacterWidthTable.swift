@@ -1,10 +1,15 @@
 // GENERATED FILE, do not edit. (Waycar patch: client screen model.)
 // Generator: Packages/SwiftMosh/Scripts/generate-character-widths.swift
-// Generated: 2026-10-07 on macOS Version 27.0.1 (Build 26A434)
-// Source: Darwin wcwidth() in en_US.UTF-8, scalars 0x0...0x10FFFF.
+// Generated: 2026-10-07 on macOS 27.0.1 (26A434)
+// Source: Darwin wcwidth_l() in en_US.UTF-8 (Unicode 15.0), scalars 0x0...0x10FFFF.
 
 enum MoshCharacterWidthTable {
-    /// Scalars the Host's `wcwidth` reports as 2 columns wide.
+    /// The libc `wide` was generated from: Darwin `wcwidth_l`, en_US.UTF-8.
+    static let sourceDescription = "Darwin wcwidth_l, en_US.UTF-8, Unicode 15.0, macOS 27.0.1 (26A434)"
+    /// The macOS build (`kern.osversion`) whose libc produced `wide`.
+    static let sourceOSBuild = "26A434"
+
+    /// Scalars the source `wcwidth` reports as 2 columns wide.
     static let wide: [ClosedRange<UInt32>] = [
         0x1100...0x115F, 0x231A...0x231B, 0x2329...0x232A, 0x23E9...0x23EC, 0x23F0...0x23F0,
         0x23F3...0x23F3, 0x25FD...0x25FE, 0x2614...0x2615, 0x2648...0x2653, 0x267F...0x267F,

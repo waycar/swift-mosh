@@ -142,8 +142,9 @@ final class MoshScreenSessionTests: XCTestCase {
     }
 
     /// omp's full-width status row (two 👁, 1 column each on the Host) on
-    /// screen while a state lands on an older base: the repaint from the
-    /// session's model shows the true state, not a row-shifted one.
+    /// screen while a cell the older-base diff skips keeps what a newer
+    /// state drew there. Upstream shows "model 21"; a model counting 👁 as
+    /// 2 columns autowraps the status row and repaints rows shifted.
     func testStateOnAnOlderBaseWithAFullWidthStatusRow() async throws {
         let link = try await makeLink()
         let status = MoshTestScreens.ompStatusRow(cols: 59)
@@ -155,16 +156,18 @@ final class MoshScreenSessionTests: XCTestCase {
                     + "\u{1B}[4;1H" + status + "\r\nmodel 10\r\nprompt")),
         ])
         try await link.send(old: 1, new: 2, [
-            .hostBytes(bytes("\u{1B}[5;7H11\u{1B}[6;7H")),
+            .hostBytes(bytes("\u{1B}[5;8H1\u{1B}[6;7H")),
         ])
         try await link.send(old: 1, new: 3, [
-            .hostBytes(bytes("\u{1B}[3;1Ha4\r\nX\u{1B}[5;8H2\u{1B}[6;7H")),
+            .hostBytes(bytes("\u{1B}[5;7H2\u{1B}[6;7H")),
         ])
 
         let display = try await link.display(afterHostBytes: 3)
-        XCTAssertEqual(display.rowTexts, ["a1", "a2", "a4", "X" + status.dropFirst(), "model 12", "prompt"])
+        XCTAssertEqual(display.rowTexts, ["a1", "a2", "a3", status, "model 20", "prompt"])
         XCTAssertEqual(display.cursor.row, 5)
         XCTAssertEqual(display.cursor.col, 6)
+        let olderBaseStates = await link.session._testOlderBaseStateCount()
+        XCTAssertEqual(olderBaseStates, 1)
 
         await link.close()
     }

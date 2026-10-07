@@ -166,13 +166,16 @@ final class MoshScreenTests: XCTestCase {
         XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{1F333}"), 2, "🌳")
         XCTAssertEqual(MoshCharacterWidth.columns(of: "⏳"), 2)
         XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{1F1E6}"), 1, "regional indicator")
-        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{3248}"), 1)
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{3248}"), 1,
+                       "Darwin-specific: glibc gives U+3248–324F 2 columns")
         XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{17000}"), 2, "Tangut")
         for narrow: Unicode.Scalar in ["◕", "▶", "⠼", "⑂", "─", "╭", "╮"] {
             XCTAssertEqual(MoshCharacterWidth.columns(of: narrow), 1, "\(narrow)")
         }
         XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{FE0F}"), 0)
         XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{FE0E}"), 0)
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{2028}"), 0, "Zl, 0 on Darwin")
+        XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{2029}"), 0, "Zp, 0 on Darwin")
         XCTAssertEqual(MoshCharacterWidth.columns(of: "\u{903}"), 1, "Mc stays 1, as in glibc")
     }
 
@@ -189,32 +192,49 @@ final class MoshScreenTests: XCTestCase {
     }
 
     #if os(macOS)
-    /// Pins the generator contract: the generated table and the zero-width
-    /// rules equal Darwin `wcwidth` (en_US.UTF-8), the Host libc.
-    func testWidthsMatchTheHostWcwidth() throws {
-        let previous = setlocale(LC_CTYPE, nil).map { String(cString: $0) } ?? "C"
-        try XCTUnwrap(setlocale(LC_CTYPE, "en_US.UTF-8"), "en_US.UTF-8 locale unavailable")
-        defer { setlocale(LC_CTYPE, previous) }
-        var values = Set(stride(from: UInt32(0x300), through: 0x10FFFF, by: 7))
-        let listed: [ClosedRange<UInt32>] = [
-            0x1F441...0x1F441, 0x1F321...0x1F32C, 0x1F336...0x1F336, 0x1F37D...0x1F37D,
-            0x1F394...0x1F39F, 0x1F3CB...0x1F3CE, 0x1F43F...0x1F43F, 0x1F4FD...0x1F4FE,
-            0x1F53E...0x1F54A, 0x1F568...0x1F579, 0x1F57B...0x1F594, 0x1F597...0x1F5A3,
-            0x1F5A5...0x1F5FA, 0x1F900...0x1F90B, 0x1F1E6...0x1F1FF, 0x3248...0x324F,
-            0x16FE0...0x16FFF, 0x17000...0x187F7, 0x18800...0x18CD5, 0x18D00...0x18D08,
-            0x1AFF0...0x1AFFE, 0x1B000...0x1B2FB, 0x1F200...0x1F265, 0x1F300...0x1F64F,
-            0x1F900...0x1F9FF, 0xFE0E...0xFE0F, 0x200B...0x200D,
-        ]
-        for range in listed { values.formUnion(range) }
+    /// Pins the generator contract: the generated wide table equals the
+    /// `wcwidth` of the libc it records, for every scalar and each range
+    /// bound ±1. Only meaningful on that macOS build; another skips.
+    func testWideTableMatchesItsRecordedSourceWcwidth() throws {
+        let host = try HostWcwidth()
+        guard host.osBuild == MoshCharacterWidthTable.sourceOSBuild else {
+            throw XCTSkip("table is from macOS \(MoshCharacterWidthTable.sourceOSBuild), this is \(host.osBuild); "
+                + "run Scripts/generate-character-widths.swift --check to compare")
+        }
         var mismatches: [String] = []
-        for value in values.sorted() {
+        func compare(_ value: UInt32) {
+            guard Unicode.Scalar(value) != nil else { return }
+            let hostWide = host.width(value) == 2
+            if MoshCharacterWidth.isWide(value) != hostWide {
+                mismatches.append("U+\(String(value, radix: 16, uppercase: true)) host wide \(hostWide)")
+            }
+        }
+        for value in UInt32(0x300)...0x10FFFF { compare(value) }
+        for range in MoshCharacterWidthTable.wide {
+            for value in [range.lowerBound, range.upperBound] {
+                compare(value &- 1)
+                compare(value)
+                compare(value &+ 1)
+            }
+        }
+        XCTAssertEqual(mismatches.count, 0, "\(mismatches.prefix(20))")
+    }
+
+    /// The zero-width rules against the running Host's `wcwidth`, for every
+    /// scalar it knows. Darwin also zeroes Mc spacing marks; the model keeps
+    /// them 1 (see `MoshCharacterWidth`).
+    func testZeroWidthRulesMatchTheHostWcwidth() throws {
+        let host = try HostWcwidth()
+        var mismatches: [String] = []
+        for value in UInt32(0x300)...0x10FFFF {
             guard let scalar = Unicode.Scalar(value) else { continue }
-            let host = Int(wcwidth(wchar_t(value)))
-            guard host >= 0 else { continue }  // unassigned or control
-            // The one documented divergence: Darwin zeroes Mc, glibc and we give 1.
-            if host == 0, scalar.properties.generalCategory == .spacingMark { continue }
+            let hostWidth = host.width(value)
+            guard hostWidth >= 0 else { continue }  // unassigned or control on the Host
+            if hostWidth == 0, scalar.properties.generalCategory == .spacingMark { continue }
             let ours = MoshCharacterWidth.columns(of: scalar)
-            if ours != host { mismatches.append("U+\(String(value, radix: 16, uppercase: true)) ours \(ours) host \(host)") }
+            if (ours == 0) != (hostWidth == 0) {
+                mismatches.append("U+\(String(value, radix: 16, uppercase: true)) ours \(ours) host \(hostWidth)")
+            }
         }
         XCTAssertEqual(mismatches.count, 0, "\(mismatches.prefix(20))")
     }
@@ -532,3 +552,30 @@ enum MoshTestScreens {
         return head + String(repeating: "─", count: cols - 19) + "╮"
     }
 }
+
+#if os(macOS)
+/// Darwin `wcwidth_l` in en_US.UTF-8, through a per-call locale so the
+/// process-global one stays untouched. `wcwidth_l` is not imported into
+/// Swift, so it is resolved from libc.
+struct HostWcwidth {
+    private typealias WcwidthL = @convention(c) (wchar_t, locale_t?) -> Int32
+    private let function: WcwidthL
+    private let locale: locale_t
+    /// The running macOS build (`kern.osversion`).
+    let osBuild: String
+
+    init() throws {
+        let symbol = try XCTUnwrap(dlsym(UnsafeMutableRawPointer(bitPattern: -2), "wcwidth_l"), "wcwidth_l")
+        function = unsafeBitCast(symbol, to: WcwidthL.self)
+        locale = try XCTUnwrap(newlocale(LC_CTYPE_MASK, "en_US.UTF-8", nil), "en_US.UTF-8 locale")
+        var buffer = [CChar](repeating: 0, count: 64)
+        var size = buffer.count
+        XCTAssertEqual(sysctlbyname("kern.osversion", &buffer, &size, nil, 0), 0)
+        osBuild = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    func width(_ value: UInt32) -> Int {
+        Int(function(wchar_t(value), locale))
+    }
+}
+#endif
