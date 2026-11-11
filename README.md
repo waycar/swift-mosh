@@ -9,7 +9,8 @@ transport, crypto and session layers are
 [wiedymi/swift-mosh](https://github.com/wiedymi/swift-mosh) `v0.1.8` (MIT),
 unchanged where no patch says otherwise; its full README is
 [UPSTREAM-README.md](UPSTREAM-README.md). This fork carries the 16 patches the
-[Waycar](https://waycar.dev) iOS app ships on top, so that other apps can use
+[Waycar](https://waycar.dev) iOS app
+([source](https://github.com/waycar/waycar-app)) ships on top, so that other apps can use
 them while we offer them upstream. If upstream takes a patch, it leaves this
 fork.
 
@@ -67,4 +68,4 @@ CI runs both on GitHub's hosted macOS runners.
 ## License
 
 MIT, as upstream: see [LICENSE](LICENSE) (© wiedymi). Waycar's patches are
-contributed under the same license.
+contributed under the same license; [NOTICE](NOTICE) credits each part.
