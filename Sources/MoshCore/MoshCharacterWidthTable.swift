@@ -1,5 +1,5 @@
 // GENERATED FILE, do not edit. (Waycar patch: client screen model.)
-// Generator: Packages/SwiftMosh/Scripts/generate-character-widths.swift
+// Generator: scripts/generate-character-widths.swift
 // Generated: 2026-10-07 on macOS 27.0.1 (26A434)
 // Source: Darwin wcwidth_l() in en_US.UTF-8 (Unicode 15.0), scalars 0x0...0x10FFFF.
 

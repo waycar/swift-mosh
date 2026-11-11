@@ -3,10 +3,10 @@
 // libc's `wcwidth_l()` (Darwin, en_US.UTF-8): every scalar it reports as
 // 2 columns wide, as sorted, merged ranges, plus a record of that source.
 //
-//   swift Scripts/generate-character-widths.swift          # rewrite the table
-//   swift Scripts/generate-character-widths.swift --check  # exit 1 on drift
+//   swift scripts/generate-character-widths.swift          # rewrite the table
+//   swift scripts/generate-character-widths.swift --check  # exit 1 on drift
 //
-// Run from Packages/SwiftMosh (or pass the package path as the last argument).
+// Run from the package root (or pass the package path as the last argument).
 import Foundation
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -97,7 +97,7 @@ let formatter = ISO8601DateFormatter()
 formatter.formatOptions = [.withFullDate]
 let header = """
 // GENERATED FILE, do not edit. (Waycar patch: client screen model.)
-// Generator: Packages/SwiftMosh/Scripts/generate-character-widths.swift
+// Generator: scripts/generate-character-widths.swift
 // Generated: \(formatter.string(from: Date())) on macOS \(osVersion) (\(osBuild))
 // Source: Darwin wcwidth_l() in en_US.UTF-8 (Unicode \(unicode)), scalars 0x0...0x10FFFF.
 

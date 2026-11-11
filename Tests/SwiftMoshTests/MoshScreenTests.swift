@@ -199,7 +199,7 @@ final class MoshScreenTests: XCTestCase {
         let host = try HostWcwidth()
         guard host.osBuild == MoshCharacterWidthTable.sourceOSBuild else {
             throw XCTSkip("table is from macOS \(MoshCharacterWidthTable.sourceOSBuild), this is \(host.osBuild); "
-                + "run Scripts/generate-character-widths.swift --check to compare")
+                + "run scripts/generate-character-widths.swift --check to compare")
         }
         var mismatches: [String] = []
         func compare(_ value: UInt32) {

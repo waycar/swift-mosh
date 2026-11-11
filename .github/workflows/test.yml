@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: swift test (macOS, with a real mosh-server)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sw_vers
+          swift --version
+      - name: Install mosh-server
+        run: |
+          brew install mosh
+          mosh-server --version | head -1
+      - name: Unit, protocol and real-server suites
+        env:
+          SWIFTMOSH_REAL_E2E: "1"
+        run: swift test

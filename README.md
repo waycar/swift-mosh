@@ -1,156 +1,70 @@
-# swift-mosh
+# swift-mosh, with Waycar's patches
 
-[![GitHub](https://img.shields.io/badge/-GitHub-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/wiedymi)
-[![Twitter](https://img.shields.io/badge/-Twitter-1DA1F2?style=flat-square&logo=twitter&logoColor=white)](https://x.com/wiedymi)
-[![Email](https://img.shields.io/badge/-Email-EA4335?style=flat-square&logo=gmail&logoColor=white)](mailto:contact@wiedymi.com)
-[![Discord](https://img.shields.io/badge/-Discord-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/zemMZtrkSb)
-[![Support me](https://img.shields.io/badge/-Support%20me-ff69b4?style=flat-square&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/vivy-company)
+A pure Swift [mosh](https://mosh.org) client for iOS and macOS: UDP transport,
+AES-128-OCB3, the State Synchronization Protocol, and now a client-side screen
+model, with no C code and no GPL code.
 
-Pure Swift implementation of the Mosh protocol/client stack for Apple platforms.
+**swift-mosh is [wiedymi](https://github.com/wiedymi)'s work.** The protocol,
+transport, crypto and session layers are
+[wiedymi/swift-mosh](https://github.com/wiedymi/swift-mosh) `v0.1.8` (MIT),
+unchanged where no patch says otherwise; its full README is
+[UPSTREAM-README.md](UPSTREAM-README.md). This fork carries the 16 patches the
+[Waycar](https://waycar.dev) iOS app ships on top, so that other apps can use
+them while we offer them upstream. If upstream takes a patch, it leaves this
+fork.
 
-This library focuses on protocol + transport + crypto + state processing only.
-Terminal UI/render adapters (Ghostty, SwiftUI terminal widgets, etc.) are intentionally out of scope so consumers can integrate with any renderer.
+## What the patches change
 
-## Features
+Every patch is described, with its tests, in [PROVENANCE.md](PROVENANCE.md);
+every changed site in `Sources/` carries a `(Waycar patch)` comment. The ones
+you notice:
 
-- Pure Swift Mosh protocol/client implementation
-- Split modules for protocol layers:
-  - `MoshCore`
-  - `MoshTransport`
-  - `MoshWire`
-  - `MoshProtoLite`
-  - `MoshCryptoOCB`
-  - `MoshCompression`
-  - `MoshBootstrap` (optional SSH handoff parser/helper)
-- Real local `mosh-server` E2E test harness
-- 100% automated test coverage across `Sources/` (via `./scripts/coverage.sh`)
+| Patch | What it fixes | Measured |
+| --- | --- | --- |
+| 16, client screen model | mosh-server builds a new state on the client's last *acknowledged* state whenever acks trail its patience (routine at a few hundred ms RTT). Upstream applied those diffs on top of the newer screen, which ran scrolls twice and left stale cells. The session now keeps a screen per recent state and repaints from the displayed one. | 300 numbered lines with every client datagram 150 ms late against a real mosh-server 1.4.0: 63–73 older-base states per run, terminal exact; upstream left 11–18 of 24 rows wrong. |
+| 16, character widths | Widths now come from a table generated from the Host libc's `wcwidth_l`, which mosh-server lays out with. A one-column disagreement (👁 counted as 2) shifted every later cell. | omp's status row under the same delay: 0 of 24 rows wrong, against 19 of 24 with hand-made emoji ranges. |
+| 3, timestamp replies | The client never echoed the server's timestamp, so mosh-server could not measure RTT and stayed at its slowest frame rate. | Same workload: ~255 frames instead of 48; keystroke echo on localhost median 67 ms instead of 182 ms. |
+| 1, 7 | Server shutdown is applied and acknowledged; the client quits with mosh's own shutdown handshake, so mosh-server and its command exit. | Real-server test: both exit. |
+| 8 | The idle heartbeat is a new state and the throwaway number is the acknowledged state, so `MOSH_SERVER_NETWORK_TMOUT` no longer cuts idle sessions and the server's 1024-state queue no longer fills. A state acknowledged during its own resend is no longer revived. | That revival stopped the heartbeat in 4 of 6 idle sessions against a real mosh-server within 5 minutes. |
+| 11–15 | Connectivity stream (stalled/connected), an enforced network timeout, rebinding to a new UDP flow on a network change, `abandon()`, and an elicited server reply for an immediate answer after a roam. | |
 
-## Platforms
-
-- iOS 16+
-- macOS 13+
-- Swift tools 6.0+
-
-## Installation
-
-Add to `Package.swift`:
+## Use it
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wiedymi/swift-mosh", from: "0.1.0")
+    .package(url: "https://github.com/waycar/swift-mosh", branch: "main")
 ]
 ```
 
-Then add products you need:
+The API is upstream's (`MoshClientSession`, `MoshEndpoint`, `hostOpStream()`),
+plus the additions above. The app bootstraps `mosh-server new` over SSH itself
+and passes the port and key in; this package does no SSH.
 
-```swift
-.target(
-    name: "YourApp",
-    dependencies: [
-        "MoshCore"
-    ]
-)
+## Test it
+
+```sh
+swift test                                   # every suite; real-server tests skip
+brew install mosh                            # mosh-server 1.4.0
+SWIFTMOSH_REAL_E2E=1 swift test              # adds the real mosh-server suites
 ```
 
-## Quick start
+CI runs both on GitHub's hosted macOS runners.
 
-```swift
-import Foundation
-import MoshCore
+## Provenance
 
-let endpoint = MoshEndpoint(
-    host: "127.0.0.1",
-    port: 60001,
-    keyBase64_22: "REPLACE_WITH_MOSH_CONNECT_KEY"
-)
-
-let session = MoshClientSession(endpoint: endpoint)
-try await session.start()
-
-try await session.enqueue(.keystrokes(Data("echo hello from swift-mosh\n".utf8)))
-
-// Streaming host output for your renderer.
-for await op in await session.hostOpStream() {
-    if case .hostBytes(let bytes) = op {
-        print(String(decoding: bytes, as: UTF8.self), terminator: "")
-    }
-}
-
-await session.stop()
-```
-
-## App suspension and process relaunch
-
-Freeze the live transport before the app is suspended, then persist the returned
-snapshot atomically:
-
-```swift
-let snapshot = try await session.prepareForApplicationBackground()
-
-// If the process remains alive:
-try await session.resumeFromApplicationBackground()
-
-// After a process relaunch:
-let restored = try await MoshClientSession.restore(from: snapshot)
-try await restored.start()
-```
-
-`MoshSnapshot` contains the Mosh session key and buffered terminal protocol data.
-Treat it as sensitive session material: keep the key in device-only secure storage,
-protect the remaining checkpoint at rest, and delete both on explicit disconnect.
-
-Reliability/lifecycle knobs are configurable in `MoshClientConfig`:
-- `sendMinDelayMs`
-- `ackIntervalMs`
-- `ackDelayMs`
-- `networkTimeoutMs` (retained for snapshot/source compatibility; network silence does not end a Mosh session)
-- `heartbeatIntervalMs`
-- `initialRtoMs`
-- `maxRtoMs`
-- `maxRetransmitCount` (caps retry bookkeeping; unacknowledged state remains pending)
-
-## Running tests
-
-```bash
-swift test
-```
-
-Coverage:
-
-```bash
-./scripts/coverage.sh
-```
-
-Run real local `mosh-server` E2E:
-
-```bash
-./scripts/run-real-e2e.sh
-```
-
-Or directly:
-
-```bash
-SWIFTMOSH_REAL_E2E=1 swift test --filter RealMoshServerE2ETests
-```
-
-## Optional Bootstrap Helper
-
-`MoshBootstrap` can parse noisy `mosh-server` output and launch a local server:
-
-```swift
-import MoshBootstrap
-
-let connect = try MoshServerLauncher.launchLocalServer()
-// connect.port, connect.key, connect.serverPID
-```
-
-## Notes
-
-- This package does not perform SSH negotiation itself.
-  - You are expected to handle auth/session bootstrap externally, then pass `host`, UDP `port`, and 22-char key to `MoshEndpoint`.
-- UI adapter is intentionally not included.
-  - Consumers should map `MoshHostOp` to their own terminal backend/view layer.
+- Upstream import: byte-identical to `v0.1.8`
+  (`9677768702727ba9094d4936062a452b9c544480`); the patch set is
+  `git diff v0.1.8 main`.
+- Patches 1–6 were written from protocol behaviour observed on the wire
+  against mosh-server 1.4.0, without consulting mosh's GPL source. The
+  semantics behind patches 7 and 8 were checked against the mosh 1.4.0 source;
+  no code, comments or names were taken. Patch 16 was written from ECMA-48 and
+  xterm semantics and observed server bytes.
+- A similarity audit (token k-grams against mosh 1.4.0, plus comment,
+  identifier and literal overlap across languages) found no copied mosh code
+  in upstream swift-mosh or in these patches.
 
 ## License
 
-MIT
+MIT, as upstream: see [LICENSE](LICENSE) (© wiedymi). Waycar's patches are
+contributed under the same license.
