@@ -51,6 +51,28 @@ SWIFTMOSH_REAL_E2E=1 swift test              # adds the real mosh-server suites
 
 CI runs both on GitHub's hosted macOS runners.
 
+## Formal models
+
+[`formal/`](formal/README.md) holds two TLA+ models of the client and the
+script that checks them with TLC. `MoshDownlink.tla` is the server-to-client
+screen sync (patches 2, 13, 15, 16): every diff applied to the base it names,
+the kept screens, the screen cap, a rebind. `MoshUplink.tla` is the
+client-to-server input path (patches 7, 8, 13): retransmission, throwaway,
+shutdown, idle states, and the sequence number as the OCB nonce. Within
+bounded loss, duplication, reordering and a network change, TLC checks that
+the terminal shows exactly the screen it claims, keystrokes all arrive in
+order, and no nonce repeats; negative controls re-create the upstream bugs and
+must fail.
+
+```sh
+formal/check.sh        # quick tier, about 5 minutes; needs Java 17+
+formal/check.sh full   # adds the deepest bounds
+formal/check.sh list   # every run and its expected outcome
+```
+
+It downloads `tla2tools.jar` v1.7.4 and checks its sha256. The `formal` CI
+job runs the quick tier on hosted Ubuntu when `formal/` changes.
+
 ## Provenance
 
 - Upstream import: byte-identical to `v0.1.8`

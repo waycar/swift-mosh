@@ -9,7 +9,8 @@ swift-mosh is the work of wiedymi:
 This repository adds the Waycar patches listed in PROVENANCE.md and marked
 "(Waycar patch)" in Sources/. They are by OTREVA, LLC for Waycar
 (https://github.com/waycar/waycar-app) and are contributed under the same MIT
-License, so they can go back upstream unchanged.
+License, so they can go back upstream unchanged. The TLA+ models in formal/
+are by OTREVA, LLC too, under the same MIT License.
 
 swift-mosh implements the mosh protocol (https://mosh.org), designed by Keith
 Winstein, John Hood, Anders Kaseorg, Keegan McAllister and the mosh
