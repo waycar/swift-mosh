@@ -411,12 +411,27 @@ public actor TransportEngine {
     /// "no reply".)
     private var pendingPeerTimestamp: (timestamp: UInt16, receivedAtMs: UInt64)?
     private static let maximumTimestampHoldMs: UInt64 = 1_000
+    /// The time outgoing packets are stamped with and a held timestamp's
+    /// hold is measured to, in `TransportClock` milliseconds; it must be the
+    /// clock the endpoint stamps `receivedAtMs` with. Tests pass one they
+    /// move by hand. (Waycar patch.)
+    private let clock: @Sendable () -> UInt64
 
     public init(endpoint: any DatagramEndpoint, outgoingDirection: MoshDirection, mtu: Int = 1200, cipher: (any TransportCipher)? = nil) {
+        self.init(
+            endpoint: endpoint, outgoingDirection: outgoingDirection, mtu: mtu, cipher: cipher,
+            clock: { TransportClock.nowMs() })
+    }
+
+    init(
+        endpoint: any DatagramEndpoint, outgoingDirection: MoshDirection, mtu: Int = 1200,
+        cipher: (any TransportCipher)? = nil, clock: @escaping @Sendable () -> UInt64
+    ) {
         self.endpoint = endpoint
         self.outgoingDirection = outgoingDirection
         self.mtu = mtu
         self.cipher = cipher
+        self.clock = clock
         self.fragmenter = MoshFragmenter()
         self.assembly = MoshFragmentAssembly()
         self.snapshot = TransportRuntimeSnapshot()
@@ -450,7 +465,7 @@ public actor TransportEngine {
         let fragments = try fragmenter.makeFragments(messageID: messageID, encodedInstruction: payload, mtu: mtu - MoshWire.packetHeaderBytes)
         // (Waycar patch) One clock read for the timestamp and the reply's
         // hold time; the reply echoes the peer's held timestamp.
-        let nowMs = TransportClock.nowMs()
+        let nowMs = clock()
         let timestamp = MoshWire.timestamp16(nowMilliseconds: nowMs)
         let timestampReply = takeTimestampReply(nowMs: nowMs)
         var currentSequence = sequence
@@ -483,7 +498,7 @@ public actor TransportEngine {
             }
         }
 
-        snapshot.lastSentAtMs = TransportClock.nowMs()
+        snapshot.lastSentAtMs = clock()
     }
 
     /// The held peer timestamp advanced by its hold time, or "no reply"

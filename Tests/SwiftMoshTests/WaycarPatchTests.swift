@@ -118,20 +118,25 @@ final class WaycarPatchTests: XCTestCase {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
         try await clientEnd.start()
         try await serverEnd.start()
-        let client = TransportEngine(endpoint: clientEnd, outgoingDirection: .toServer)
-        let server = TransportEngine(endpoint: serverEnd, outgoingDirection: .toClient)
+        // The hold is measured on a clock only the test moves, which the
+        // engines and the client's datagram arrivals all read; a pause past
+        // the 1 s hold limit would otherwise rightly send no reply.
+        let clock = ManualClock()
+        let client = TransportEngine(
+            endpoint: ClockStampedEndpoint(inner: clientEnd, clock: clock), outgoingDirection: .toServer,
+            clock: clock.read)
+        let server = TransportEngine(endpoint: serverEnd, outgoingDirection: .toClient, clock: clock.read)
 
         try await server.sendPayload(Data("state".utf8))
         let fromServer = try await client.receivePayload()
-        try await Task.sleep(nanoseconds: 60_000_000)
+        clock.advance(byMs: 60)
         try await client.sendPayload(Data("ack".utf8))
         let first = try await server.receivePayload()
 
         // Upstream always sends "no reply", so mosh-server never measures RTT.
         XCTAssertNotEqual(first.timestampReply, UInt16.max)
         let held = MoshWire.timestampDiff(new: first.timestampReply, old: fromServer.timestamp)
-        XCTAssertGreaterThanOrEqual(held, 50, "the reply must advance by the time the timestamp was held")
-        XCTAssertLessThan(held, 1_000)
+        XCTAssertEqual(held, 60, "the reply must advance by the time the timestamp was held")
 
         try await client.sendPayload(Data("again".utf8))
         let second = try await server.receivePayload()
@@ -302,18 +307,22 @@ final class WaycarPatchTests: XCTestCase {
 
     func testInputPacedPastTheStartOfAShutdownIsNotSent() async throws {
         var config = MoshClientConfig()
-        config.sendMinDelayMs = 1_000
+        // The pacing delay is a real-time sleep: long enough that the
+        // shutdown below starts within it through a multi-second stall.
+        config.sendMinDelayMs = 3_000
         let (session, server, serverEnd) = try await makeLinkedSession(config: config)
         let log = AckLog()
         let recorder = recordAcks(from: server, into: log)
         try await session.enqueue(.keystrokes(Data("a".utf8)))
 
         // The second input waits out the pacing delay; the shutdown starts
-        // meanwhile and is still waiting for its ack when that delay ends.
+        // meanwhile and is still waiting for its ack when that delay ends,
+        // since the server acks it only then.
         let paced = Task { try await session.enqueue(.keystrokes(Data("b".utf8))) }
         try await Task.sleep(nanoseconds: 100_000_000)
-        let shutdown = Task { await session.shutdown(ackTimeoutMs: 2_000) }
+        let shutdown = Task { await session.shutdown(ackTimeoutMs: 60_000) }
         let result = await paced.result
+        try await sendAck(from: server, ackNum: UInt64.max)
         await shutdown.value
 
         XCTAssertThrowsError(try result.get(), "input after the shutdown began must be refused")
@@ -574,5 +583,29 @@ final class WaycarPatchTests: XCTestCase {
             return first
         }
         return try XCTUnwrap(texts, "the host stream did not finish within \(seconds)s")
+    }
+}
+
+/// An in-memory endpoint that stamps each datagram it receives with
+/// `clock`'s time, as a real endpoint stamps its arrival.
+private struct ClockStampedEndpoint: DatagramEndpoint {
+    let inner: InMemoryDatagramEndpoint
+    let clock: ManualClock
+
+    func start() async throws {
+        try await inner.start()
+    }
+
+    func stop() async {
+        await inner.stop()
+    }
+
+    func send(_ data: Data) async throws {
+        try await inner.send(data)
+    }
+
+    func receive() async throws -> TransportDatagram {
+        let datagram = try await inner.receive()
+        return TransportDatagram(data: datagram.data, receivedAtMs: clock.nowMs)
     }
 }

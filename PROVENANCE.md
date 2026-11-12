@@ -247,14 +247,18 @@ taken.
     `_testOlderBaseStateCount()` is a Waycar test hook (the real-server
     suite asserts older-base states arrived); re-vendoring must keep it.
 17. **Test clock and hooks** (`MoshClientSession`'s internal init,
-    `NetworkDatagramEndpoint`). The internal init takes the session's clock
+    `TransportEngine`'s internal init, `NetworkDatagramEndpoint`).
+    `TransportEngine` takes the clock it stamps packets with and measures a
+    held peer timestamp's hold to (patch 3; default `TransportClock`), so a
+    test that also stamps its datagrams' arrival with that clock sets the
+    hold exactly. The session's internal init takes the session's clock
     (default `TransportClock.nowMs()`), and every window the session
     measures reads it: stall, network timeout, heartbeat, retransmission,
     acks, pacing and the shutdown deadline. Two waits stay real-time sleeps
     whose length it decides: the pacing delay and the shutdown's backstop
     sleep, which ends a shutdown whose send never completes. RTT samples
-    keep `TransportClock`, since they compare against timestamps the engine
-    stamps with it. Tests that assert on those windows pass a clock they
+    keep `TransportClock`, since they compare against timestamps the
+    session's engine stamps with it. Tests that assert on those windows pass a clock they
     move by hand (`ManualClock`), so a loaded Mac's scheduler pause is not
     silence: CI on the shared runner saw `[connected, stalled, connected]`
     from the idle-heartbeat test, whose 400 ms stall threshold ran on the
@@ -262,9 +266,10 @@ taken.
     pass at the clock's current time, so a test knows a moment was judged;
     `NetworkDatagramEndpoint._testPendingReceiveCount()` tells a test a
     receive is waiting before it delivers an error or stops the endpoint
-    (an error with no receive waiting is dropped). The app constructs
-    sessions with the public init only, so its clock is unchanged.
-    Re-vendoring must keep the seam and both hooks.
+    (an error with no receive waiting is dropped). Sessions build their
+    engines, and the app its sessions, with the public inits only, so
+    neither clock changes outside tests. Re-vendoring must keep both seams
+    and both hooks.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
