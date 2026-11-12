@@ -19,26 +19,32 @@ extension WaycarPatchTests {
         var config = MoshClientConfig()
         config.stallThresholdMs = 200
         config.heartbeatIntervalMs = 10_000
-        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        let clock = ManualClock()
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config, clock: clock)
         let log = ConnectivityLog()
         let collector = log.collect(await session.connectivityStream())
 
-        let connected = await waitUntil(within: 1) { await log.values == [.connected] }
+        let connected = await waitUntil { await log.values == [.connected] }
         XCTAssertTrue(connected, "a running session reports its connectivity on subscription")
-        let stalled = await waitUntil(within: 2) { await log.values == [.connected, .stalled] }
+        clock.advance(byMs: 199)
+        _ = await session._testRunMaintenanceLoopIteration()
+        let early = await log.values
+        XCTAssertEqual(early, [.connected], "silence short of the threshold is no stall")
+        clock.advance(byMs: 1)
+        let stalled = await waitUntil { await log.values == [.connected, .stalled] }
         XCTAssertTrue(stalled, "silence past the threshold must report a stall")
 
-        let contactSentAt = TransportClock.nowMs()
+        clock.advance(byMs: 1)
         try await sendAck(from: server, ackNum: 0)
-        let recovered = await waitUntil(within: 1) { await log.values == [.connected, .stalled, .connected] }
+        let recovered = await waitUntil { await log.values == [.connected, .stalled, .connected] }
         XCTAssertTrue(recovered, "the next server datagram must report the session connected again")
         // The datagram must count as contact, which the stall is measured
         // from, not only republish `.connected`.
         let lastContact = await session._testLastServerContactAtMs()
-        XCTAssertGreaterThanOrEqual(lastContact, contactSentAt, "the datagram must count as contact")
+        XCTAssertEqual(lastContact, clock.nowMs, "the datagram must count as contact")
 
         await session.stop()
-        let finished = await waitUntil(within: 1) { await log.isFinished }
+        let finished = await waitUntil { await log.isFinished }
         XCTAssertTrue(finished, "the stream ends with the session")
         collector.cancel() // Only reached unfinished when the assertion above failed.
         await collector.value
@@ -50,25 +56,38 @@ extension WaycarPatchTests {
         config.heartbeatIntervalMs = 100
         config.stallThresholdMs = 400
         config.networkTimeoutMs = 600
-        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
-        // Acks every new client state. mosh-server acks an empty one (the
+        // The session's time moves only here, one heartbeat interval at a
+        // time, so a scheduler pause on a loaded Mac is no silence.
+        let clock = ManualClock()
+        let (session, server, serverEnd) = try await makeLinkedSession(config: config, clock: clock)
+        // Acks every new client state, and only those, so its contact comes
+        // from the heartbeats alone. mosh-server acks an empty one (the
         // heartbeat) only on its 3 s ack interval; this stands in for that
         // cadence at the test's scaled-down heartbeat and thresholds.
         let responder = Task {
+            var acked: UInt64 = 0
             while let received = try? await server.receivePayload() {
                 guard
                     let plain = try? MoshCompressionCodec().decompress(received.payload, algorithm: .zlib),
                     let instruction = try? TransportInstruction(decoding: plain),
-                    let newNum = instruction.newNum, newNum != UInt64.max
+                    let newNum = instruction.newNum, newNum != UInt64.max, newNum > acked
                 else { continue }
+                acked = newNum
                 try? await server.sendPayload(try ackPayload(newNum))
             }
         }
         let log = ConnectivityLog()
         let collector = log.collect(await session.connectivityStream())
 
-        // Several stall thresholds and network timeouts without any input.
-        try await Task.sleep(nanoseconds: 1_500_000_000)
+        // Several stall thresholds and network timeouts without any input:
+        // each interval's heartbeat must draw the server's ack, which the
+        // stall and the timeout are measured from.
+        for _ in 0..<15 {
+            clock.advance(byMs: UInt64(config.heartbeatIntervalMs))
+            let answered = await waitUntil { await session._testLastServerContactAtMs() == clock.nowMs }
+            XCTAssertTrue(answered, "each interval's heartbeat must reach the server and draw its ack")
+            guard answered else { break }
+        }
 
         let values = await log.values
         XCTAssertEqual(values, [.connected], "an idle session the server answers must never stall")
@@ -85,15 +104,10 @@ extension WaycarPatchTests {
     // MARK: - Rebind
 
     func testRebindMovesToAFreshFlowAndResendsTheCurrentState() async throws {
-        var config = MoshClientConfig()
-        config.sendMinDelayMs = 0
-        config.initialRtoMs = 5_000
-        config.maxRtoMs = 5_000
-        config.heartbeatIntervalMs = 10_000
         let serverEnd = InMemoryDatagramEndpoint()
         try await serverEnd.start()
         let flows = FlowRegistry(server: serverEnd)
-        let (session, server) = try await makeSession(config: config, serverEnd: serverEnd, flows: flows)
+        let (session, server) = try await makeSession(config: idleServerConfig(), serverEnd: serverEnd, flows: flows)
 
         try await session.enqueue(.keystrokes(Data("x".utf8)))
         let first = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
@@ -103,7 +117,7 @@ extension WaycarPatchTests {
         XCTAssertEqual(flows.count, 2, "a rebind opens a new flow")
         let oldFlowStopped = await flows.flow(0)?.isStopped
         XCTAssertEqual(oldFlowStopped, true, "the old flow is released")
-        // The retransmission timeout is 5 s: only the rebind sends it now.
+        // The retransmission timeout is beyond the wait: only the rebind sends it now.
         let resent = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
         XCTAssertEqual(resent.diff, first.diff, "the unacknowledged state is resent on the new flow")
         // The server ignores a state it holds already; a new one follows.
@@ -112,13 +126,13 @@ extension WaycarPatchTests {
 
         // The server roams to the new flow; its datagrams must still arrive.
         try await sendState(from: server, old: 0, new: 1, text: "after-rebind")
-        let delivered = await waitUntil(within: 1) {
+        let delivered = await waitUntil {
             await session.drainHostOps().contains(.hostBytes(Data("after-rebind".utf8)))
         }
         XCTAssertTrue(delivered, "the receive loop must follow the new flow")
 
         try await sendAck(from: server, ackNum: 2)
-        let acked = await waitUntil(within: 1) { await session._testPendingOutboundCount() == 0 }
+        let acked = await waitUntil { await session._testPendingOutboundCount() == 0 }
         XCTAssertTrue(acked)
         await session.rebindTransport()
         XCTAssertEqual(flows.count, 3)
@@ -142,7 +156,7 @@ extension WaycarPatchTests {
 
         await session.rebindTransport()
         try await sendState(from: server, old: 0, new: 1, text: "reply")
-        let delivered = await waitUntil(within: 1) { await log.texts == ["reply"] }
+        let delivered = await waitUntil { await log.texts == ["reply"] }
         XCTAssertTrue(delivered)
 
         // The reply can only arrive once the receive loop has left the old
@@ -165,7 +179,7 @@ extension WaycarPatchTests {
         let log = ClientStateLog()
         let responder = answerNonEmptyStates(from: server, into: log)
         try await session.enqueue(.resize(cols: 80, rows: 24))
-        let sized = await waitUntil(within: 2) { await session._testPendingOutboundCount() == 0 }
+        let sized = await waitUntil { await session._testPendingOutboundCount() == 0 }
         XCTAssertTrue(sized, "the server acks the size at once")
 
         let contactBefore = await session._testLastServerContactAtMs()
@@ -174,7 +188,7 @@ extension WaycarPatchTests {
         XCTAssertEqual(flows.count, 2)
         // An empty state would be answered only on the server's 3 s ack
         // interval, which this server never reaches.
-        let answered = await waitUntil(within: 2) {
+        let answered = await waitUntil {
             let pending = await session._testPendingOutboundCount()
             let contact = await session._testLastServerContactAtMs()
             return pending == 0 && contact > contactBefore
@@ -192,16 +206,11 @@ extension WaycarPatchTests {
     func testRebindSendsFromAFreshEphemeralLocalPort() async throws {
         let probe = try UDPProbe()
         defer { probe.close() }
-        var config = MoshClientConfig()
-        config.sendMinDelayMs = 0
-        config.initialRtoMs = 5_000
-        config.maxRtoMs = 5_000
-        config.heartbeatIntervalMs = 10_000
         let session = MoshClientSession(
             endpoint: MoshEndpoint(
                 host: "127.0.0.1", port: probe.port,
                 keyBase64_22: try MoshBase64Key(raw: Data(repeating: 0x42, count: 16)).printable),
-            config: config)
+            config: idleServerConfig())
         try await session.start()
 
         try await session.enqueue(.keystrokes(Data("x".utf8)))
@@ -231,7 +240,7 @@ extension WaycarPatchTests {
                 await session.rebindTransport()
                 finish.finish()
             }
-            let waiting = await waitUntil(within: 1) { await stalledFlow.isWaitingToStart }
+            let waiting = await waitUntil { await stalledFlow.isWaitingToStart }
             XCTAssertTrue(waiting, "the new flow must still be connecting")
 
             let snapshot = try await session.makeSnapshot()
@@ -241,12 +250,12 @@ extension WaycarPatchTests {
                 "restarting from sequence 0 would reuse the cipher's nonces")
 
             await session.stop()
-            let returned = await finishes(rebound, within: 1)
+            let returned = await finishes(rebound, within: waitCeilingSeconds)
             XCTAssertTrue(returned, "a rebind waiting on a flow returns once the session stops")
         }
         // The receive loop waits for the new flow while it connects; the stop
         // must end that wait, or its task keeps the session alive forever.
-        let deadline = TransportClock.nowMs() + 1_000
+        let deadline = TransportClock.nowMs() + UInt64(waitCeilingSeconds * 1000)
         while released != nil, TransportClock.nowMs() < deadline {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -262,13 +271,13 @@ extension WaycarPatchTests {
         let responder = answerNonEmptyStates(from: server, into: log)
         try await session.enqueue(.resize(cols: 100, rows: 30))
         try await session.enqueue(.keystrokes(Data("x".utf8)))
-        let settled = await waitUntil(within: 2) { await session._testPendingOutboundCount() == 0 }
+        let settled = await waitUntil { await session._testPendingOutboundCount() == 0 }
         XCTAssertTrue(settled)
 
         let sentSize = await session.elicitServerReply()
 
         XCTAssertTrue(sentSize)
-        let answered = await waitUntil(within: 2) { await session._testPendingOutboundCount() == 0 }
+        let answered = await waitUntil { await session._testPendingOutboundCount() == 0 }
         XCTAssertTrue(answered, "an idle server must answer the elicited state at once")
         let states = await log.states
         XCTAssertEqual(states.map(\.newNum), [1, 2, 3])
@@ -310,10 +319,10 @@ extension WaycarPatchTests {
 
         await client.holdSends()
         let resizing = Task { try await session.enqueue(.resize(cols: 120, rows: 40)) }
-        let resizeOut = await waitUntil(within: 1) { await client.heldSendCount == 1 }
+        let resizeOut = await waitUntil { await client.heldSendCount == 1 }
         XCTAssertTrue(resizeOut)
         let eliciting = Task { await session.elicitServerReply() }
-        let elicitOut = await waitUntil(within: 1) { await client.heldSendCount == 2 }
+        let elicitOut = await waitUntil { await client.heldSendCount == 2 }
         XCTAssertTrue(elicitOut)
         await client.releaseSends()
         try await resizing.value
@@ -342,7 +351,7 @@ extension WaycarPatchTests {
         let hostOps = await session.hostOpStream()
         let connectivity = await session.connectivityStream()
         try await session.enqueue(.keystrokes(Data("x".utf8)))
-        let sent = await waitUntil(within: 1) { await log.newNums().contains(1) }
+        let sent = await waitUntil { await log.newNums().contains(1) }
         XCTAssertTrue(sent)
 
         await session.abandon()
@@ -353,9 +362,9 @@ extension WaycarPatchTests {
         XCTAssertNil(failure)
         let pending = await session._testPendingOutboundCount()
         XCTAssertEqual(pending, 0, "undeliverable input is dropped")
-        let hostOpsEnded = await streamFinishes(hostOps, within: 1)
+        let hostOpsEnded = await streamFinishes(hostOps, within: waitCeilingSeconds)
         XCTAssertTrue(hostOpsEnded)
-        let connectivityEnded = await streamFinishes(connectivity, within: 1)
+        let connectivityEnded = await streamFinishes(connectivity, within: waitCeilingSeconds)
         XCTAssertTrue(connectivityEnded)
         try await Task.sleep(nanoseconds: 200_000_000)
         let newNums = await log.newNums()
@@ -380,11 +389,11 @@ extension WaycarPatchTests {
             await session.shutdown(ackTimeoutMs: 60_000)
             endShutdown.finish()
         }
-        let inFlight = await waitUntil(within: 1) { await log.newNums().contains(UInt64.max) }
+        let inFlight = await waitUntil { await log.newNums().contains(UInt64.max) }
         XCTAssertTrue(inFlight, "the shutdown must be waiting for its ack")
 
         await session.abandon()
-        let returned = await finishes(shutdownEnded, within: 5)
+        let returned = await finishes(shutdownEnded, within: waitCeilingSeconds)
 
         XCTAssertTrue(returned, "the shutdown's caller must not wait out its deadline")
         let state = await session.state
@@ -397,7 +406,7 @@ extension WaycarPatchTests {
 
     func testFirstInputAfterStartIsSentWithoutPacing() async throws {
         var config = MoshClientConfig()
-        // Far beyond the 2 s `nextInstruction` waits for the state.
+        // Far beyond the wait ceiling `nextInstruction` waits for the state.
         config.sendMinDelayMs = 60_000
         let (session, server, serverEnd) = try await makeLinkedSession(config: config)
 
@@ -446,13 +455,13 @@ extension WaycarPatchTests {
         return await finishes(ended, within: seconds)
     }
 
-    /// No heartbeat, pacing or retransmission within a test: every state the
-    /// server sees was sent once, on purpose.
+    /// No heartbeat, pacing or retransmission within a test's waits: every
+    /// state the server sees was sent once, on purpose.
     private func idleServerConfig() -> MoshClientConfig {
         var config = MoshClientConfig()
         config.sendMinDelayMs = 0
-        config.initialRtoMs = 10_000
-        config.maxRtoMs = 10_000
+        config.initialRtoMs = 60_000
+        config.maxRtoMs = 60_000
         config.heartbeatIntervalMs = 60_000
         return config
     }
@@ -631,7 +640,7 @@ private final class UDPProbe: @unchecked Sendable {
         address.sin_family = sa_family_t(AF_INET)
         address.sin_addr.s_addr = inet_addr("127.0.0.1")
         address.sin_port = 0
-        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        var timeout = timeval(tv_sec: Int(waitCeilingSeconds), tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -652,7 +661,8 @@ private final class UDPProbe: @unchecked Sendable {
         port = UInt16(bigEndian: address.sin_port)
     }
 
-    /// The source port of the next datagram, or nil after 2 s without one.
+    /// The source port of the next datagram, or nil after the wait ceiling
+    /// without one.
     func nextSourcePort() async -> UInt16? {
         await Task.detached { [descriptor] () -> UInt16? in
             var buffer = [UInt8](repeating: 0, count: 2_048)

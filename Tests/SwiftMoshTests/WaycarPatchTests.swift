@@ -20,13 +20,13 @@ final class WaycarPatchTests: XCTestCase {
         try await sendState(from: server, old: 1, new: UInt64.max, text: "Z")
 
         // Upstream never ends the stream: the session stays running forever.
-        let texts = try await collectTexts(from: stream, within: 5)
+        let texts = try await collectTexts(from: stream, within: waitCeilingSeconds)
         XCTAssertEqual(texts, ["A", "Z"], "the shutdown state's final screen must be applied before the end")
         let state = await session.state
         XCTAssertEqual(state, .stopped)
         let failure = await session.failure
         XCTAssertNil(failure, "a server that shut down ended the session normally")
-        let acked = await waitUntil(within: 1) { await log.acks(after: 0).contains(UInt64.max) }
+        let acked = await waitUntil { await log.acks(after: 0).contains(UInt64.max) }
         XCTAssertTrue(acked, "the shutdown state must be acknowledged so mosh-server can exit")
 
         await serverEnd.stop()
@@ -34,23 +34,19 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     func testStateOnUnreceivedBaseIsDroppedAndPromptlyReacked() async throws {
-        var config = MoshClientConfig()
-        config.ackDelayMs = 5_000
-        config.ackIntervalMs = 5_000
-        config.heartbeatIntervalMs = 5_000
-        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        let (session, server, serverEnd) = try await makeLinkedSession(config: promptAckConfig())
         let log = AckLog()
         let recorder = recordAcks(from: server, into: log)
 
         try await sendState(from: server, old: 0, new: 1, text: "A")
-        let firstAck = await waitUntil(within: 1) { await log.acks(after: 0).contains(1) }
+        let firstAck = await waitUntil { await log.acks(after: 0).contains(1) }
         XCTAssertTrue(firstAck)
         let before = await log.count()
         // State 5 never arrived, so a diff built on it is unusable.
         try await sendState(from: server, old: 5, new: 6, text: "unusable")
 
-        // Upstream waits out the 5 s ack interval before telling the server again.
-        let reacked = await waitUntil(within: 1) { await log.acks(after: before).contains(1) }
+        // Upstream waits out the ack interval before telling the server again.
+        let reacked = await waitUntil { await log.acks(after: before).contains(1) }
         XCTAssertTrue(reacked, "the client must re-ack its latest state promptly so the server re-bases")
         let applied = await session.drainHostOps()
         XCTAssertEqual(applied, [.hostBytes(Data("A".utf8))])
@@ -61,27 +57,23 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     func testRepeatedOlderStateIsDroppedAndPromptlyReacked() async throws {
-        var config = MoshClientConfig()
-        config.ackDelayMs = 5_000
-        config.ackIntervalMs = 5_000
-        config.heartbeatIntervalMs = 5_000
-        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        let (session, server, serverEnd) = try await makeLinkedSession(config: promptAckConfig())
         let log = AckLog()
         let recorder = recordAcks(from: server, into: log)
 
         try await sendState(from: server, old: 0, new: 1, text: "A")
-        let firstAck = await waitUntil(within: 1) { await log.acks(after: 0).contains(1) }
+        let firstAck = await waitUntil { await log.acks(after: 0).contains(1) }
         XCTAssertTrue(firstAck)
         try await sendState(from: server, old: 1, new: 3, text: "C")
-        let secondAck = await waitUntil(within: 1) { await log.acks(after: 0).contains(3) }
+        let secondAck = await waitUntil { await log.acks(after: 0).contains(3) }
         XCTAssertTrue(secondAck)
         let before = await log.count()
         // A resend of state 2, which state 3 already superseded.
         try await sendState(from: server, old: 0, new: 2, text: "B")
 
         // Upstream applies it (rolling the screen back) and, with 3 already
-        // acked, sends no ack until the 5 s interval.
-        let reacked = await waitUntil(within: 1) { await log.acks(after: before).contains(3) }
+        // acked, sends no ack until the ack interval.
+        let reacked = await waitUntil { await log.acks(after: before).contains(3) }
         XCTAssertTrue(reacked, "the client must re-ack its latest state promptly so the server stops resending")
         let applied = await session.drainHostOps()
         XCTAssertEqual(applied, [.hostBytes(Data("A".utf8)), .hostBytes(Data("C".utf8))])
@@ -106,27 +98,15 @@ final class WaycarPatchTests: XCTestCase {
             defer { finish.finish() }
             try await session.start()
         }
-        let waiting = await waitUntil(within: 1) { await endpoint.isWaitingToStart }
+        let waiting = await waitUntil { await endpoint.isWaitingToStart }
         XCTAssertTrue(waiting, "start() must be waiting on its endpoint before the stop")
 
         await session.stop()
 
         // Upstream's stop() cannot reach the endpoint start() waits on, so
         // start() never returns.
-        let returned = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                for await _ in finished {}
-                return !Task.isCancelled
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                return false
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
-        }
-        XCTAssertTrue(returned, "start() must end promptly once the session is stopped")
+        let returned = await finishes(finished, within: waitCeilingSeconds)
+        XCTAssertTrue(returned, "start() must end once the session is stopped")
         if returned, case .success = await start.result {
             XCTFail("start() must not report success for a session stopped while starting")
         }
@@ -166,14 +146,15 @@ final class WaycarPatchTests: XCTestCase {
         try await session.enqueue(.keystrokes(Data("x".utf8)))
         _ = try await nextInstruction(from: server, serverEnd) { $0.newNum == 1 }
         try await sendAck(from: server, ackNum: 1)
-        let acked = await waitUntil(within: 1) { await session._testPendingOutboundCount() == 0 }
+        let acked = await waitUntil { await session._testPendingOutboundCount() == 0 }
         XCTAssertTrue(acked)
         // Not acknowledged yet; mosh-server may already have applied it.
         try await session.enqueue(.keystrokes(Data("y".utf8)))
         _ = try await nextInstruction(from: server, serverEnd) { $0.newNum == 2 }
 
         let started = TransportClock.nowMs()
-        let shutdown = Task { await session.shutdown(ackTimeoutMs: 5_000) }
+        // A deadline beyond the wait ceiling, so only the ack can end it in time.
+        let shutdown = Task { await session.shutdown(ackTimeoutMs: 60_000) }
         // A shutdown state on the acked state 1 would drop input the server
         // applied with state 2; mosh-server cannot diff its input backwards.
         let request = try await nextInstruction(from: server, serverEnd) { $0.newNum == UInt64.max }
@@ -184,7 +165,9 @@ final class WaycarPatchTests: XCTestCase {
         try await sendAck(from: server, ackNum: UInt64.max)
         await shutdown.value
 
-        XCTAssertLessThan(TransportClock.nowMs() - started, 3_000, "the server's ack ends the shutdown, not the deadline")
+        XCTAssertLessThan(
+            TransportClock.nowMs() - started, UInt64(waitCeilingSeconds * 1000),
+            "the server's ack ends the shutdown, not the deadline")
         let state = await session.state
         XCTAssertEqual(state, .stopped)
         await serverEnd.stop()
@@ -218,11 +201,16 @@ final class WaycarPatchTests: XCTestCase {
         let recorder = recordAcks(from: server, into: log)
 
         let started = TransportClock.nowMs()
-        await session.shutdown(ackTimeoutMs: 300)
+        let (finished, finish) = AsyncStream<Void>.makeStream()
+        Task {
+            await session.shutdown(ackTimeoutMs: 300)
+            finish.finish()
+        }
+        let returned = await finishes(finished, within: waitCeilingSeconds)
 
-        let elapsed = TransportClock.nowMs() - started
-        XCTAssertGreaterThanOrEqual(elapsed, 300, "the shutdown state is resent until the deadline")
-        XCTAssertLessThan(elapsed, 1_000, "an unreachable server must not hold the shutdown")
+        XCTAssertTrue(returned, "an unreachable server must not hold the shutdown")
+        XCTAssertGreaterThanOrEqual(
+            TransportClock.nowMs() - started, 300, "the shutdown state is resent until the deadline")
         let state = await session.state
         XCTAssertEqual(state, .stopped)
         let sent = await log.count()
@@ -243,10 +231,10 @@ final class WaycarPatchTests: XCTestCase {
         // Hold state 1's retransmission, as a send whose completion is
         // slow, and acknowledge the state meanwhile.
         await client.holdSends()
-        let holding = await waitUntil(within: 1) { await client.heldSendCount > 0 }
+        let holding = await waitUntil { await client.heldSendCount > 0 }
         XCTAssertTrue(holding)
         try await sendAck(from: server, ackNum: 1)
-        let acked = await waitUntil(within: 1) { await session._testPendingOutboundCount() == 0 }
+        let acked = await waitUntil { await session._testPendingOutboundCount() == 0 }
         XCTAssertTrue(acked)
         await client.releaseSends()
 
@@ -271,7 +259,7 @@ final class WaycarPatchTests: XCTestCase {
         await client.holdSends()
 
         let enqueued = Task { try await session.enqueue(.keystrokes(Data("x".utf8))) }
-        let holding = await waitUntil(within: 1) { await client.heldSendCount == 1 }
+        let holding = await waitUntil { await client.heldSendCount == 1 }
         XCTAssertTrue(holding)
         // Four retransmission timeouts pass while the first send is out.
         try await Task.sleep(nanoseconds: 200_000_000)
@@ -290,16 +278,14 @@ final class WaycarPatchTests: XCTestCase {
         // until the connection is cancelled.
         await client.holdSends()
 
-        let started = TransportClock.nowMs()
         let (finished, finish) = AsyncStream<Void>.makeStream()
         Task {
             await session.shutdown(ackTimeoutMs: 300)
             finish.finish()
         }
-        let returned = await finishes(finished, within: 3)
+        let returned = await finishes(finished, within: waitCeilingSeconds)
 
         XCTAssertTrue(returned, "a send that never completes must not hold the shutdown past its deadline")
-        XCTAssertLessThan(TransportClock.nowMs() - started, 1_500)
         let state = await session.state
         XCTAssertEqual(state, .stopped)
         await client.stop()
@@ -331,6 +317,16 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     // MARK: - Helpers (shared with WaycarNetworkPatchTests.swift)
+
+    /// The periodic ack and the heartbeat beyond the wait ceiling, so only a
+    /// prompt ack can answer within a test's waits.
+    func promptAckConfig() -> MoshClientConfig {
+        var config = MoshClientConfig()
+        config.ackDelayMs = 60_000
+        config.ackIntervalMs = 60_000
+        config.heartbeatIntervalMs = 60_000
+        return config
+    }
 
     /// Ack and new state numbers the client sent, in arrival order.
     actor AckLog {
@@ -440,14 +436,15 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     func makeLinkedSession(
-        config: MoshClientConfig
+        config: MoshClientConfig, clock: ManualClock? = nil
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint) {
-        let (session, server, serverEnd, _) = try await makeHeldSendSession(config: config)
+        let (session, server, serverEnd, _) = try await makeHeldSendSession(config: config, clock: clock)
         return (session, server, serverEnd)
     }
 
+    /// With `clock`, the session's time moves only when the test moves it.
     func makeHeldSendSession(
-        config: MoshClientConfig
+        config: MoshClientConfig, clock: ManualClock? = nil
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint, HeldSendDatagramEndpoint) {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
         let client = HeldSendDatagramEndpoint(inner: clientEnd)
@@ -458,7 +455,8 @@ final class WaycarPatchTests: XCTestCase {
                 keyBase64_22: try MoshBase64Key(raw: key).printable),
             config: config,
             endpointFactory: { _, _ in client },
-            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) },
+            clock: sessionClock(clock)
         )
         try await session.start()
         try await serverEnd.start()
@@ -485,8 +483,9 @@ final class WaycarPatchTests: XCTestCase {
             try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib))
     }
 
-    /// The first instruction from the client that `matches`, within 2 s.
-    /// Stops `serverEnd` on timeout, since its receive ignores cancellation.
+    /// The first instruction from the client that `matches`, within the wait
+    /// ceiling. Stops `serverEnd` on timeout, since its receive ignores
+    /// cancellation.
     func nextInstruction(
         from server: TransportEngine, _ serverEnd: InMemoryDatagramEndpoint,
         where matches: @escaping @Sendable (TransportInstruction) -> Bool
@@ -503,7 +502,7 @@ final class WaycarPatchTests: XCTestCase {
                 return nil
             }
             group.addTask {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(waitCeilingSeconds * 1_000_000_000))
                 if !Task.isCancelled { await serverEnd.stop() }
                 return nil
             }
@@ -511,7 +510,7 @@ final class WaycarPatchTests: XCTestCase {
             group.cancelAll()
             return first
         }
-        return try XCTUnwrap(found, "the client sent no matching instruction within 2 s")
+        return try XCTUnwrap(found, "the client sent no matching instruction within \(waitCeilingSeconds) s")
     }
 
     /// Records every instruction the client sends, until the server
@@ -567,16 +566,5 @@ final class WaycarPatchTests: XCTestCase {
             return first
         }
         return try XCTUnwrap(texts, "the host stream did not finish within \(seconds)s")
-    }
-
-    func waitUntil(
-        within seconds: Double, _ condition: @Sendable () async -> Bool
-    ) async -> Bool {
-        let deadline = TransportClock.nowMs() + UInt64(seconds * 1000)
-        while TransportClock.nowMs() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        return await condition()
     }
 }

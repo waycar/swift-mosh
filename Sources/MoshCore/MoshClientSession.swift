@@ -20,6 +20,12 @@ public actor MoshClientSession {
 
     private let endpointFactory: @Sendable (MoshEndpoint, MoshClientConfig) -> any DatagramEndpoint
     private let snapshotEncoder: @Sendable (SessionStateBlob) throws -> Data
+    /// The session's time, in `TransportClock` milliseconds: every window
+    /// it measures (stall, network timeout, heartbeat, retransmission, acks,
+    /// pacing, the shutdown deadline) reads it. Only RTT samples use
+    /// `TransportClock` itself, since the engine stamps packets with it.
+    /// Tests pass a clock they move by hand. (Waycar patch.)
+    private let clock: @Sendable () -> UInt64
 
     private(set) public var endpoint: MoshEndpoint
     private(set) public var config: MoshClientConfig
@@ -143,6 +149,7 @@ public actor MoshClientSession {
             )
         }
         self.snapshotEncoder = Self.defaultSnapshotEncoder
+        self.clock = { TransportClock.nowMs() }
         self.currentRtoMs = Double(config.initialRtoMs)
     }
 
@@ -150,12 +157,14 @@ public actor MoshClientSession {
         endpoint: MoshEndpoint,
         config: MoshClientConfig,
         endpointFactory: @escaping @Sendable (MoshEndpoint, MoshClientConfig) -> any DatagramEndpoint,
-        snapshotEncoder: @escaping @Sendable (SessionStateBlob) throws -> Data
+        snapshotEncoder: @escaping @Sendable (SessionStateBlob) throws -> Data,
+        clock: @escaping @Sendable () -> UInt64 = { TransportClock.nowMs() }
     ) {
         self.endpoint = endpoint
         self.config = config
         self.endpointFactory = endpointFactory
         self.snapshotEncoder = snapshotEncoder
+        self.clock = clock
         self.currentRtoMs = Double(config.initialRtoMs)
     }
 
@@ -221,7 +230,7 @@ public actor MoshClientSession {
         }
 
         self.engine = engine
-        let now = TransportClock.nowMs()
+        let now = clock()
         lastOutboundAtMs = now
         lastNewStateAtMs = now // (Waycar patch)
         lastStateSendAtMs = 0
@@ -343,7 +352,7 @@ public actor MoshClientSession {
         let diff = lastSentSize.map {
             UserMessage(instructions: [.resize(width: $0.cols, height: $0.rows)]).encoded()
         }
-        try? await sendStateReportingAcks(diff: diff, nowMs: TransportClock.nowMs())
+        try? await sendStateReportingAcks(diff: diff, nowMs: clock())
         return diff != nil
     }
 
@@ -460,7 +469,7 @@ public actor MoshClientSession {
         )
 
         let payload = try encodeInstruction(instruction)
-        let now = TransportClock.nowMs()
+        let now = clock()
         let pending = PendingOutboundInstruction(
             stateNum: stateNum,
             payload: payload,
@@ -474,7 +483,7 @@ public actor MoshClientSession {
         lastNewStateAtMs = now
         try? await sendPayload(payload)
         // Optional chaining: a state acknowledged during the send stays gone.
-        let sentAt = TransportClock.nowMs()
+        let sentAt = clock()
         pendingOutbound[stateNum]?.lastSentAtMs = sentAt
         pendingOutbound[stateNum]?.nextRetryAtMs = sentAt &+ UInt64(currentRtoClampedMs())
     }
@@ -545,7 +554,7 @@ public actor MoshClientSession {
         return MoshSnapshot(
             endpoint: endpoint,
             transportState: stateData,
-            createdAtMs: TransportClock.nowMs(),
+            createdAtMs: clock(),
             schemaVersion: 2
         )
     }
@@ -605,7 +614,7 @@ public actor MoshClientSession {
         // (Waycar patch) Snapshots carry no screens.
         screensMatchTerminal = false
 
-        let now = TransportClock.nowMs()
+        let now = clock()
         pendingOutbound = Dictionary(
             uniqueKeysWithValues: blob.pendingOutbound.map { snapshot in
                 (
@@ -642,7 +651,7 @@ public actor MoshClientSession {
     private func runMaintenanceLoopIteration() async -> Bool {
         guard case .running = state else { return false }
 
-        let now = TransportClock.nowMs()
+        let now = clock()
         // (Waycar patch) Measured from the last server datagram on the
         // process clock, which keeps counting while the process is
         // suspended, so the first pass after a long suspension ends it.
@@ -690,7 +699,7 @@ public actor MoshClientSession {
             // (Waycar patch) With network crypto on (always, in the app) the
             // engine returns only datagrams that authenticated: contact with
             // the server.
-            lastServerContactAtMs = TransportClock.nowMs()
+            lastServerContactAtMs = clock()
             updateConnectivity(nowMs: lastServerContactAtMs)
             updateRtt(from: incoming)
 
@@ -704,7 +713,7 @@ public actor MoshClientSession {
             // (Waycar patch) Re-ack a state that was not applied right away
             // rather than on the maintenance loop's next pass, at most once
             // per `reackSpacingMs`.
-            let now = TransportClock.nowMs()
+            let now = clock()
             if ackDirtyAtMs != nil, latestReceivedStateNum > lastAckReportedNum {
                 try? await sendAckOnly(nowMs: now)
             } else if reackRequested, now >= lastAckSentAtMs, now - lastAckSentAtMs >= Self.reackSpacingMs {
@@ -800,7 +809,7 @@ public actor MoshClientSession {
                 }
                 engine = replacement
                 pendingTransportSnapshot = nil
-                lastOutboundAtMs = TransportClock.nowMs()
+                lastOutboundAtMs = clock()
                 resumeTransportWaiters()
                 return true
             } catch {
@@ -830,7 +839,7 @@ public actor MoshClientSession {
     /// Retransmits every unacknowledged state on a new transport at once,
     /// instead of when its retransmission next falls due. (Waycar patch.)
     private func resendUnacknowledgedStates() async {
-        let now = TransportClock.nowMs()
+        let now = clock()
         for stateNum in pendingOutboundOrder {
             pendingOutbound[stateNum]?.nextRetryAtMs = now
         }
@@ -856,6 +865,13 @@ public actor MoshClientSession {
 
     func _testRunReceiveLoopIteration() async -> Bool {
         await runReceiveLoopIteration()
+    }
+
+    /// One maintenance pass at the clock's current time, so a test that
+    /// moved its clock knows the session has judged that moment. (Waycar
+    /// patch.)
+    func _testRunMaintenanceLoopIteration() async -> Bool {
+        await runMaintenanceLoopIteration()
     }
 
     func _testPendingOutboundCount() -> Int {
@@ -956,7 +972,7 @@ public actor MoshClientSession {
                 let floor = latestReceivedStateNum > 2048 ? latestReceivedStateNum - 2048 : 0
                 appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= floor })
             }
-            ackDirtyAtMs = TransportClock.nowMs()
+            ackDirtyAtMs = clock()
             if newNum == UInt64.max {
                 // The server's shutdown state: its command exited. It carries
                 // the final screen diff like any other state. Acking the
@@ -1083,6 +1099,8 @@ public actor MoshClientSession {
             return
         }
 
+        // The engine's clock, not the session's: the reply echoes a
+        // timestamp the engine stamped with it. (Waycar patch.)
         let now16 = MoshWire.timestamp16(nowMilliseconds: TransportClock.nowMs())
         let sample = Double(MoshWire.timestampDiff(new: now16, old: incoming.timestampReply))
         applyRttSample(sample)
@@ -1236,17 +1254,17 @@ public actor MoshClientSession {
     private func applySendMinDelayIfNeeded() async throws {
         guard config.sendMinDelayMs > 0 else { return }
         guard lastStateSendAtMs > 0 else {
-            lastStateSendAtMs = TransportClock.nowMs()
+            lastStateSendAtMs = clock()
             return
         }
 
-        let now = TransportClock.nowMs()
+        let now = clock()
         let elapsed = now >= lastStateSendAtMs ? now - lastStateSendAtMs : 0
         if elapsed < UInt64(config.sendMinDelayMs) {
             let sleepMs = UInt64(config.sendMinDelayMs) - elapsed
             try await Task.sleep(nanoseconds: sleepMs * 1_000_000)
         }
-        lastStateSendAtMs = TransportClock.nowMs()
+        lastStateSendAtMs = clock()
     }
 
     private func sendPayload(_ payload: Data) async throws {
@@ -1254,7 +1272,7 @@ public actor MoshClientSession {
             throw MoshSessionError.notStarted
         }
         try await engine.sendPayload(payload)
-        lastOutboundAtMs = TransportClock.nowMs()
+        lastOutboundAtMs = clock()
     }
 
     private func encodeInstruction(_ instruction: TransportInstruction) throws -> Data {
@@ -1384,7 +1402,7 @@ public actor MoshClientSession {
         state = .stopping
         for _ in 0..<Self.shutdownAckRepeats {
             try? await Task.sleep(nanoseconds: 40_000_000)
-            try? await sendAckOnly(nowMs: TransportClock.nowMs())
+            try? await sendAckOnly(nowMs: clock())
         }
         await shutdownRuntime()
         state = .stopped
@@ -1401,7 +1419,7 @@ public actor MoshClientSession {
         state = .stopping
         // Clamped so the nanosecond conversion cannot overflow.
         let timeoutMs = min(ackTimeoutMs, UInt64.max / 1_000_000)
-        let deadline = TransportClock.nowMs() &+ timeoutMs
+        let deadline = clock() &+ timeoutMs
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.sendShutdownUntilAcknowledged(deadline: deadline) }
             group.addTask { try? await Task.sleep(nanoseconds: timeoutMs * 1_000_000) }
@@ -1419,7 +1437,7 @@ public actor MoshClientSession {
     private func sendShutdownUntilAcknowledged(deadline: UInt64) async {
         var nextSendAtMs: UInt64 = 0
         while !localShutdownAcknowledged, engine != nil, !Task.isCancelled {
-            let now = TransportClock.nowMs()
+            let now = clock()
             guard now < deadline else { return }
             try? await processRetransmitQueue(nowMs: now)
             if now >= nextSendAtMs {

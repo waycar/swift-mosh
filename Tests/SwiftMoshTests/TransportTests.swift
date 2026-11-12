@@ -240,7 +240,9 @@ final class TransportTests: XCTestCase {
         fake.sendError = nil
 
         let waitingOnError = Task { try await endpoint.receive() }
-        try? await Task.sleep(nanoseconds: 2_000_000)
+        // An error that comes before the receive waits is dropped.
+        let errorAwaited = await waitUntil { await endpoint._testPendingReceiveCount() == 1 }
+        XCTAssertTrue(errorAwaited)
         fake.emitReceive(content: nil, error: .posix(.ECONNRESET))
         do {
             _ = try await waitingOnError.value
@@ -255,7 +257,8 @@ final class TransportTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 2_000_000)
 
         let waitingOnStop = Task { try await endpoint.receive() }
-        try? await Task.sleep(nanoseconds: 2_000_000)
+        let stopAwaited = await waitUntil { await endpoint._testPendingReceiveCount() == 1 }
+        XCTAssertTrue(stopAwaited)
         await endpoint.stop()
         do {
             _ = try await waitingOnStop.value
@@ -304,7 +307,8 @@ final class TransportTests: XCTestCase {
         try await cancelledStart.value
 
         let waitingReceive = Task { try await cancelledEndpoint.receive() }
-        try? await Task.sleep(nanoseconds: 2_000_000)
+        let cancelAwaited = await waitUntil { await cancelledEndpoint._testPendingReceiveCount() == 1 }
+        XCTAssertTrue(cancelAwaited)
         cancelledConnection.emitState(.cancelled)
         do {
             _ = try await waitingReceive.value
@@ -604,20 +608,4 @@ private final class FakeUDPConnection: UDPConnection, @unchecked Sendable {
         lock.unlock()
         callback?(content, nil, true, error)
     }
-}
-
-private func waitUntil(
-    timeoutNs: UInt64 = 1_000_000_000,
-    stepNs: UInt64 = 2_000_000,
-    condition: @escaping @Sendable () -> Bool
-) async -> Bool {
-    var waited: UInt64 = 0
-    while waited < timeoutNs {
-        if condition() {
-            return true
-        }
-        try? await Task.sleep(nanoseconds: stepNs)
-        waited += stepNs
-    }
-    return condition()
 }

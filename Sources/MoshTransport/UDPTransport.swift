@@ -267,6 +267,12 @@ public actor NetworkDatagramEndpoint: DatagramEndpoint {
     func _testArmReceiveLoop() {
         armReceiveLoop()
     }
+
+    /// Receives waiting for a datagram, so a test knows one is registered
+    /// before it delivers an error or stops the endpoint. (Waycar patch.)
+    func _testPendingReceiveCount() -> Int {
+        receiveContinuations.count
+    }
 }
 
 public actor InMemoryDatagramEndpoint: DatagramEndpoint {

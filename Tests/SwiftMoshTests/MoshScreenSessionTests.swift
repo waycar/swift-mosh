@@ -243,12 +243,12 @@ final class MoshScreenSessionTests: XCTestCase {
 
         /// The published ops once `count` host-bytes ops have arrived.
         func waitForHostBytes(_ count: Int) async throws -> [MoshHostOp] {
-            let deadline = TransportClock.nowMs() + 2_000
+            let deadline = TransportClock.nowMs() + UInt64(waitCeilingSeconds * 1000)
             while await log.hostBytesCount < count, TransportClock.nowMs() < deadline {
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             let seen = await log.hostBytesCount
-            XCTAssertEqual(seen, count, "host-bytes ops published within 2 s")
+            XCTAssertEqual(seen, count, "host-bytes ops published within \(waitCeilingSeconds) s")
             return await log.ops
         }
 

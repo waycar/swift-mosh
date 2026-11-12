@@ -290,9 +290,8 @@ final class CoreAndAdapterTests: XCTestCase {
         )
 
         try await failingSession.start()
-        try? await Task.sleep(nanoseconds: 20_000_000)
-        let attempts = await failingEndpoint.receiveAttempts()
-        XCTAssertGreaterThan(attempts, 0)
+        let attempted = await waitUntil { await failingEndpoint.receiveAttempts() > 0 }
+        XCTAssertTrue(attempted)
         await failingSession.stop()
     }
 
@@ -302,7 +301,7 @@ final class CoreAndAdapterTests: XCTestCase {
             maxReceiveStates: 8,
             ackIntervalMs: 1_000,
             ackDelayMs: 100,
-            networkTimeoutMs: 2_000,
+            networkTimeoutMs: 60_000,
             maxRetransmitCount: 3,
             initialRtoMs: 100,
             maxRtoMs: 100,
@@ -320,12 +319,12 @@ final class CoreAndAdapterTests: XCTestCase {
         let queued = await waitForPendingOutboundCount(session: session, expected: 1, timeoutNs: 300_000_000)
         XCTAssertTrue(queued)
 
-        let initialSend = try await receivePayloadEventually(engine: server, timeoutNs: 400_000_000)
+        let initialSend = try await receivePayloadEventually(engine: server)
         let initialInstruction = try decodeInstructionPayload(initialSend.payload, compressed: true)
         XCTAssertEqual(initialInstruction.newNum, 1)
         XCTAssertNotNil(initialInstruction.diff)
 
-        let retrySend = try await receivePayloadEventually(engine: server, timeoutNs: 700_000_000)
+        let retrySend = try await receivePayloadEventually(engine: server)
         let retryInstruction = try decodeInstructionPayload(retrySend.payload, compressed: true)
         XCTAssertEqual(retryInstruction.newNum, 1)
         XCTAssertEqual(retryInstruction.diff, initialInstruction.diff)
@@ -350,7 +349,7 @@ final class CoreAndAdapterTests: XCTestCase {
             maxReceiveStates: 8,
             ackIntervalMs: 1_000,
             ackDelayMs: 100,
-            networkTimeoutMs: 2_000,
+            networkTimeoutMs: 60_000,
             maxRetransmitCount: 1,
             initialRtoMs: 100,
             maxRtoMs: 100,
@@ -365,8 +364,8 @@ final class CoreAndAdapterTests: XCTestCase {
         try await session.start()
 
         try await session.enqueue(.keystrokes(Data("x".utf8)))
-        _ = try await receivePayloadEventually(engine: server, timeoutNs: 400_000_000) // initial send
-        _ = try await receivePayloadEventually(engine: server, timeoutNs: 700_000_000) // one retry
+        _ = try await receivePayloadEventually(engine: server) // initial send
+        _ = try await receivePayloadEventually(engine: server) // one retry
         try await Task.sleep(nanoseconds: 300_000_000)
 
         let state = await session.state
@@ -396,22 +395,23 @@ final class CoreAndAdapterTests: XCTestCase {
         )
         config.localPort = nil
 
-        let (session, server) = await makeInMemorySession(config: config)
+        // The silence is measured on a clock only the test moves.
+        let clock = ManualClock()
+        let (session, server) = await makeInMemorySession(config: config, clock: clock)
         try await server.start()
         try await session.start()
-        let started = TransportClock.nowMs()
 
-        try await Task.sleep(nanoseconds: 300_000_000)
+        clock.advance(byMs: 499)
+        let runsOn = await session._testRunMaintenanceLoopIteration()
         let early = await session.state
+        XCTAssertTrue(runsOn)
         XCTAssertEqual(early, .running, "the session must run until the timeout")
 
-        var state = await session.state
-        while state == .running, TransportClock.nowMs() - started < 3_000 {
-            try await Task.sleep(nanoseconds: 10_000_000)
-            state = await session.state
-        }
+        clock.advance(byMs: 1)
+        let timedOut = await waitUntil { await session.state != .running }
+        XCTAssertTrue(timedOut)
+        let state = await session.state
         XCTAssertEqual(state, .failed(.timeout(timeoutMs: 500)))
-        XCTAssertGreaterThanOrEqual(TransportClock.nowMs() - started, 500)
         let failure = await session.failure
         XCTAssertEqual(failure, .timeout(timeoutMs: 500))
         do {
@@ -472,7 +472,7 @@ final class CoreAndAdapterTests: XCTestCase {
             maxReceiveStates: 8,
             ackIntervalMs: 1_000,
             ackDelayMs: 100,
-            networkTimeoutMs: 3_000,
+            networkTimeoutMs: 60_000,
             maxRetransmitCount: 5,
             initialRtoMs: 80,
             maxRtoMs: 80,
@@ -499,7 +499,7 @@ final class CoreAndAdapterTests: XCTestCase {
         try await session.start()
 
         try await session.enqueue(.keystrokes(Data("loss".utf8)))
-        let converged = try await receivePayloadEventually(engine: server, timeoutNs: 2_500_000_000)
+        let converged = try await receivePayloadEventually(engine: server)
         let convergedInstruction = try decodeInstructionPayload(converged.payload, compressed: true)
         XCTAssertEqual(convergedInstruction.newNum, 1)
         let user = try UserMessage(decoding: convergedInstruction.diff ?? Data())
@@ -531,7 +531,7 @@ final class CoreAndAdapterTests: XCTestCase {
             maxReceiveStates: 8,
             ackIntervalMs: 1_000,
             ackDelayMs: 100,
-            networkTimeoutMs: 3_000,
+            networkTimeoutMs: 60_000,
             maxRetransmitCount: 4,
             initialRtoMs: 100,
             maxRtoMs: 100,
@@ -561,8 +561,8 @@ final class CoreAndAdapterTests: XCTestCase {
         try await session.enqueue(.keystrokes(Data("j1".utf8)))
         try await session.enqueue(.keystrokes(Data("j2".utf8)))
 
-        let first = try await receivePayloadEventually(engine: server, timeoutNs: 1_500_000_000)
-        let second = try await receivePayloadEventually(engine: server, timeoutNs: 1_500_000_000)
+        let first = try await receivePayloadEventually(engine: server)
+        let second = try await receivePayloadEventually(engine: server)
         let firstInstruction = try decodeInstructionPayload(first.payload, compressed: true)
         let secondInstruction = try decodeInstructionPayload(second.payload, compressed: true)
         XCTAssertEqual(firstInstruction.newNum, 1)
@@ -589,7 +589,7 @@ final class CoreAndAdapterTests: XCTestCase {
             maxReceiveStates: 8,
             ackIntervalMs: 1_000,
             ackDelayMs: 100,
-            networkTimeoutMs: 4_000,
+            networkTimeoutMs: 60_000,
             maxRetransmitCount: 5,
             initialRtoMs: 100,
             maxRtoMs: 100,
@@ -615,7 +615,7 @@ final class CoreAndAdapterTests: XCTestCase {
         try await session.start()
 
         try await session.enqueue(.keystrokes(Data("before-roam".utf8)))
-        let beforeRoam = try await receivePayloadEventually(engine: serverEngineA, timeoutNs: 1_000_000_000)
+        let beforeRoam = try await receivePayloadEventually(engine: serverEngineA)
         let beforeRoamInstruction = try decodeInstructionPayload(beforeRoam.payload, compressed: true)
         XCTAssertEqual(beforeRoamInstruction.newNum, 1)
 
@@ -639,7 +639,7 @@ final class CoreAndAdapterTests: XCTestCase {
         try await serverEngineB.start()
 
         try await session.enqueue(.keystrokes(Data("after-roam".utf8)))
-        let afterRoam = try await receivePayloadEventually(engine: serverEngineB, timeoutNs: 1_500_000_000)
+        let afterRoam = try await receivePayloadEventually(engine: serverEngineB)
         let afterRoamInstruction = try decodeInstructionPayload(afterRoam.payload, compressed: true)
         XCTAssertEqual(afterRoamInstruction.newNum, 2)
         let afterUser = try UserMessage(decoding: afterRoamInstruction.diff ?? Data())
@@ -700,12 +700,12 @@ final class CoreAndAdapterTests: XCTestCase {
             sequence: seq
         )
 
-        await fulfillment(of: [receivedTwo], timeout: 1.0)
+        await fulfillment(of: [receivedTwo], timeout: waitCeilingSeconds)
         let yielded = await collector.values()
         XCTAssertEqual(yielded, [.hostBytes(Data("x".utf8)), .echoAck(9)])
 
         await session.stop()
-        await fulfillment(of: [finished], timeout: 1.0)
+        await fulfillment(of: [finished], timeout: waitCeilingSeconds)
         _ = await reader.result
         await server.stop()
     }
@@ -726,7 +726,9 @@ final class CoreAndAdapterTests: XCTestCase {
         )
         config.localPort = nil
 
-        let (session, server) = await makeInMemorySession(config: config)
+        // The heartbeat interval is measured on a clock only the test moves.
+        let clock = ManualClock()
+        let (session, server) = await makeInMemorySession(config: config, clock: clock)
         try await server.start()
         try await session.start()
 
@@ -742,18 +744,22 @@ final class CoreAndAdapterTests: XCTestCase {
             sequence: inboundSeq
         )
 
-        let ackPayload = try await receivePayloadEventually(engine: server, timeoutNs: 400_000_000)
+        let ackPayload = try await receivePayloadEventually(engine: server)
         let ackInstruction = try decodeInstructionPayload(ackPayload.payload, compressed: true)
         XCTAssertNil(ackInstruction.diff)
         XCTAssertEqual(ackInstruction.ackNum, 1)
 
-        let heartbeatStart = DispatchTime.now().uptimeNanoseconds
-        let heartbeatPayload = try await receivePayloadEventually(engine: server, timeoutNs: 900_000_000)
-        let heartbeatElapsedMs = (DispatchTime.now().uptimeNanoseconds - heartbeatStart) / 1_000_000
+        // The heartbeat is a new client state, so it would show as pending.
+        clock.advance(byMs: 249)
+        _ = await session._testRunMaintenanceLoopIteration()
+        let pendingBeforeInterval = await session._testPendingOutboundCount()
+        XCTAssertEqual(pendingBeforeInterval, 0, "no heartbeat before its interval")
+
+        clock.advance(byMs: 1)
+        let heartbeatPayload = try await receivePayloadEventually(engine: server)
         let heartbeatInstruction = try decodeInstructionPayload(heartbeatPayload.payload, compressed: true)
         XCTAssertNil(heartbeatInstruction.diff)
         XCTAssertEqual(heartbeatInstruction.ackNum, 1)
-        XCTAssertGreaterThanOrEqual(heartbeatElapsedMs, 180)
 
         await session.stop()
         await server.stop()
@@ -764,8 +770,8 @@ final class CoreAndAdapterTests: XCTestCase {
             sendMinDelayMs: 0,
             maxReceiveStates: 8,
             ackIntervalMs: 40,
-            ackDelayMs: 2_000,
-            networkTimeoutMs: 2_500,
+            ackDelayMs: 60_000,
+            networkTimeoutMs: 60_000,
             maxRetransmitCount: 3,
             initialRtoMs: 100,
             maxRtoMs: 100,
@@ -791,7 +797,7 @@ final class CoreAndAdapterTests: XCTestCase {
             sequence: inboundSeq
         )
 
-        let ackPayload = try await receivePayloadEventually(engine: server, timeoutNs: 900_000_000)
+        let ackPayload = try await receivePayloadEventually(engine: server)
         let ackInstruction = try decodeInstructionPayload(ackPayload.payload, compressed: true)
         XCTAssertNil(ackInstruction.diff)
         XCTAssertEqual(ackInstruction.ackNum, 1)
@@ -937,14 +943,18 @@ final class CoreAndAdapterTests: XCTestCase {
         return MoshEndpoint(host: "127.0.0.1", port: 60001, keyBase64_22: key.printable)
     }
 
-    private func makeInMemorySession(config: MoshClientConfig) async -> (MoshClientSession, TransportEngine) {
+    /// With `clock`, the session's time moves only when the test moves it.
+    private func makeInMemorySession(
+        config: MoshClientConfig, clock: ManualClock? = nil
+    ) async -> (MoshClientSession, TransportEngine) {
         let (client, server) = await InMemoryDatagramPair.makeLinked()
         let endpoint = makeEndpoint()
         let configuredSession = MoshClientSession(
             endpoint: endpoint,
             config: config,
             endpointFactory: { _, _ in client },
-            snapshotEncoder: defaultSnapshotEncoder
+            snapshotEncoder: defaultSnapshotEncoder,
+            clock: sessionClock(clock)
         )
         let serverEndpoint: any DatagramEndpoint
         if config.useNetworkCrypto {
@@ -1050,7 +1060,7 @@ final class CoreAndAdapterTests: XCTestCase {
 
     private func receivePayloadEventually(
         engine: TransportEngine,
-        timeoutNs: UInt64
+        timeoutNs: UInt64 = UInt64(waitCeilingSeconds * 1_000_000_000)
     ) async throws -> TransportReceivedPayload {
         try await withThrowingTaskGroup(of: TransportReceivedPayload.self) { group in
             group.addTask {

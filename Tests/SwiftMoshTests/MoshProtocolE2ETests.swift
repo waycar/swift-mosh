@@ -62,7 +62,7 @@ final class MoshProtocolE2ETests: XCTestCase {
             )
             try await serverEngine.sendPayload(payload)
 
-            let deadline = Date().addingTimeInterval(1)
+            let deadline = Date().addingTimeInterval(waitCeilingSeconds)
             var received = Data()
             while Date() < deadline {
                 for op in await session.drainHostOps() {
@@ -139,10 +139,10 @@ final class MoshProtocolE2ETests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000) // 5ms between sends
         }
 
-        // Collect host ops until all 5 states arrived (at most 2 s)
+        // Collect host ops until all 5 states arrived
         var ops: [MoshHostOp] = []
         var hostBytesCount = 0
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(waitCeilingSeconds)
         while hostBytesCount < 5, Date() < deadline {
             let drained = await session.drainHostOps()
             ops += drained
@@ -217,9 +217,9 @@ final class MoshProtocolE2ETests: XCTestCase {
             try await serverEngine.sendPayload(payload)
         }
 
-        // Feed the output into a terminal within 500ms
+        // Feed the output into a terminal
         var display = MoshScreen(cols: 80, rows: 24)
-        let deadline = Date().addingTimeInterval(0.5)
+        let deadline = Date().addingTimeInterval(waitCeilingSeconds)
         while Date() < deadline {
             display.apply(await session.drainHostOps())
             if display.text(ofRow: 2) == "user@host:~$" {
@@ -308,9 +308,9 @@ final class MoshProtocolE2ETests: XCTestCase {
             try await session.enqueue(.keystrokes(Data(String(char).utf8)))
         }
 
-        // Collect echoed output within 2 seconds, on a terminal
+        // Collect echoed output on a terminal
         var display = MoshScreen(cols: 80, rows: 24)
-        let deadline = Date().addingTimeInterval(2.0)
+        let deadline = Date().addingTimeInterval(waitCeilingSeconds)
         while Date() < deadline {
             display.apply(await session.drainHostOps())
             if display.text(ofRow: 0) == input { break }
