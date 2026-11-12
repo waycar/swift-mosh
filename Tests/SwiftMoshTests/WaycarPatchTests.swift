@@ -307,10 +307,12 @@ final class WaycarPatchTests: XCTestCase {
 
     func testInputPacedPastTheStartOfAShutdownIsNotSent() async throws {
         var config = MoshClientConfig()
-        // The pacing delay is a real-time sleep: long enough that the
-        // shutdown below starts within it through a multi-second stall.
-        config.sendMinDelayMs = 3_000
-        let (session, server, serverEnd) = try await makeLinkedSession(config: config)
+        config.sendMinDelayMs = 1_000
+        // The session's clock stands still, so the second input is always
+        // paced, and its pacing lasts until the test releases it.
+        let pacing = PacingGate()
+        let (session, server, serverEnd) = try await makeLinkedSession(
+            config: config, clock: ManualClock(), pacing: pacing)
         let log = AckLog()
         let recorder = recordAcks(from: server, into: log)
         try await session.enqueue(.keystrokes(Data("a".utf8)))
@@ -319,8 +321,12 @@ final class WaycarPatchTests: XCTestCase {
         // meanwhile and is still waiting for its ack when that delay ends,
         // since the server acks it only then.
         let paced = Task { try await session.enqueue(.keystrokes(Data("b".utf8))) }
-        try await Task.sleep(nanoseconds: 100_000_000)
+        let held = await waitUntil { await pacing.waiting == 1 }
+        XCTAssertTrue(held, "the second input must be waiting out the pacing delay")
         let shutdown = Task { await session.shutdown(ackTimeoutMs: 60_000) }
+        let begun = await waitUntil { await log.newNums().contains(UInt64.max) }
+        XCTAssertTrue(begun, "the shutdown must have begun before the pacing delay ends")
+        await pacing.release()
         let result = await paced.result
         try await sendAck(from: server, ackNum: UInt64.max)
         await shutdown.value
@@ -453,15 +459,17 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     func makeLinkedSession(
-        config: MoshClientConfig, clock: ManualClock? = nil
+        config: MoshClientConfig, clock: ManualClock? = nil, pacing: PacingGate? = nil
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint) {
-        let (session, server, serverEnd, _) = try await makeHeldSendSession(config: config, clock: clock)
+        let (session, server, serverEnd, _) = try await makeHeldSendSession(
+            config: config, clock: clock, pacing: pacing)
         return (session, server, serverEnd)
     }
 
-    /// With `clock`, the session's time moves only when the test moves it.
+    /// With `clock`, the session's time moves only when the test moves it;
+    /// with `pacing`, paced input waits until the test releases it.
     func makeHeldSendSession(
-        config: MoshClientConfig, clock: ManualClock? = nil
+        config: MoshClientConfig, clock: ManualClock? = nil, pacing: PacingGate? = nil
     ) async throws -> (MoshClientSession, TransportEngine, InMemoryDatagramEndpoint, HeldSendDatagramEndpoint) {
         let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
         let client = HeldSendDatagramEndpoint(inner: clientEnd)
@@ -473,7 +481,8 @@ final class WaycarPatchTests: XCTestCase {
             config: config,
             endpointFactory: { _, _ in client },
             snapshotEncoder: { blob in try JSONEncoder().encode(blob) },
-            clock: sessionClock(clock)
+            clock: sessionClock(clock),
+            pacingSleep: pacingSleep(pacing)
         )
         try await session.start()
         try await serverEnd.start()

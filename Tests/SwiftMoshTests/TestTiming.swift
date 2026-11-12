@@ -50,3 +50,28 @@ func sessionClock(_ clock: ManualClock?) -> @Sendable () -> UInt64 {
     guard let clock else { return { TransportClock.nowMs() } }
     return clock.read
 }
+
+/// Pacing sleeps (`MoshClientConfig.sendMinDelayMs`) that last until the
+/// test releases them, so input is held in pacing exactly as long as the
+/// test needs.
+actor PacingGate {
+    private(set) var waiting = 0
+    private var held: [CheckedContinuation<Void, Never>] = []
+
+    func sleep() async {
+        waiting += 1
+        await withCheckedContinuation { held.append($0) }
+    }
+
+    func release() {
+        let released = held
+        held.removeAll()
+        for continuation in released { continuation.resume() }
+    }
+}
+
+/// The pacing sleep a test session uses: `gate`'s, or a real one without it.
+func pacingSleep(_ gate: PacingGate?) -> @Sendable (UInt64) async throws -> Void {
+    guard let gate else { return { try await Task.sleep(nanoseconds: $0 * 1_000_000) } }
+    return { _ in await gate.sleep() }
+}

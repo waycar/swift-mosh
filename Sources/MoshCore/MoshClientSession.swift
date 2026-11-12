@@ -22,11 +22,14 @@ public actor MoshClientSession {
     private let snapshotEncoder: @Sendable (SessionStateBlob) throws -> Data
     /// The session's time, in `TransportClock` milliseconds: every window
     /// it measures (stall, network timeout, heartbeat, retransmission, acks,
-    /// pacing, the shutdown deadline) reads it. The pacing delay and the
-    /// shutdown's backstop are still slept in real time. Only RTT samples
-    /// use `TransportClock` itself, since the engine stamps packets with it.
-    /// Tests pass a clock they move by hand. (Waycar patch.)
+    /// pacing, the shutdown deadline) reads it. The shutdown's backstop is
+    /// still slept in real time. Only RTT samples use `TransportClock`
+    /// itself, since the engine stamps packets with it. Tests pass a clock
+    /// they move by hand. (Waycar patch.)
     private let clock: @Sendable () -> UInt64
+    /// Sleeps out the pacing delay (`config.sendMinDelayMs`), given in
+    /// milliseconds. Tests pass one they release by hand. (Waycar patch.)
+    private let pacingSleep: @Sendable (UInt64) async throws -> Void
 
     private(set) public var endpoint: MoshEndpoint
     private(set) public var config: MoshClientConfig
@@ -151,6 +154,7 @@ public actor MoshClientSession {
         }
         self.snapshotEncoder = Self.defaultSnapshotEncoder
         self.clock = { TransportClock.nowMs() }
+        self.pacingSleep = { try await Task.sleep(nanoseconds: $0 * 1_000_000) }
         self.currentRtoMs = Double(config.initialRtoMs)
     }
 
@@ -159,13 +163,17 @@ public actor MoshClientSession {
         config: MoshClientConfig,
         endpointFactory: @escaping @Sendable (MoshEndpoint, MoshClientConfig) -> any DatagramEndpoint,
         snapshotEncoder: @escaping @Sendable (SessionStateBlob) throws -> Data,
-        clock: @escaping @Sendable () -> UInt64 = { TransportClock.nowMs() }
+        clock: @escaping @Sendable () -> UInt64 = { TransportClock.nowMs() },
+        pacingSleep: @escaping @Sendable (UInt64) async throws -> Void = {
+            try await Task.sleep(nanoseconds: $0 * 1_000_000)
+        }
     ) {
         self.endpoint = endpoint
         self.config = config
         self.endpointFactory = endpointFactory
         self.snapshotEncoder = snapshotEncoder
         self.clock = clock
+        self.pacingSleep = pacingSleep
         self.currentRtoMs = Double(config.initialRtoMs)
     }
 
@@ -1263,7 +1271,7 @@ public actor MoshClientSession {
         let elapsed = now >= lastStateSendAtMs ? now - lastStateSendAtMs : 0
         if elapsed < UInt64(config.sendMinDelayMs) {
             let sleepMs = UInt64(config.sendMinDelayMs) - elapsed
-            try await Task.sleep(nanoseconds: sleepMs * 1_000_000)
+            try await pacingSleep(sleepMs)
         }
         lastStateSendAtMs = clock()
     }

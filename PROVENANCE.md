@@ -254,9 +254,11 @@ taken.
     hold exactly. The session's internal init takes the session's clock
     (default `TransportClock.nowMs()`), and every window the session
     measures reads it: stall, network timeout, heartbeat, retransmission,
-    acks, pacing and the shutdown deadline. Two waits stay real-time sleeps
-    whose length it decides: the pacing delay and the shutdown's backstop
-    sleep, which ends a shutdown whose send never completes. RTT samples
+    acks, pacing and the shutdown deadline. It also takes the sleep that
+    waits out the pacing delay (default `Task.sleep`), so a test can hold
+    input in pacing for as long as it needs. The shutdown's backstop sleep,
+    which ends a shutdown whose send never completes, stays real-time; its
+    length is the deadline the clock also measures. RTT samples
     keep `TransportClock`, since they compare against timestamps the
     session's engine stamps with it. Tests that assert on those windows pass a clock they
     move by hand (`ManualClock`), so a loaded Mac's scheduler pause is not
@@ -268,8 +270,8 @@ taken.
     receive is waiting before it delivers an error or stops the endpoint
     (an error with no receive waiting is dropped). Sessions build their
     engines, and the app its sessions, with the public inits only, so
-    neither clock changes outside tests. Re-vendoring must keep both seams
-    and both hooks.
+    nothing changes outside tests. Re-vendoring must keep the seams and
+    both hooks.
 
 `Tests/SwiftMoshTests/WaycarPatchTests.swift` covers the shutdown state
 (final screen applied, maximum state acked, session ends `.stopped` without a
