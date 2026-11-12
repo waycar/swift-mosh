@@ -22,8 +22,9 @@ public actor MoshClientSession {
     private let snapshotEncoder: @Sendable (SessionStateBlob) throws -> Data
     /// The session's time, in `TransportClock` milliseconds: every window
     /// it measures (stall, network timeout, heartbeat, retransmission, acks,
-    /// pacing, the shutdown deadline) reads it. Only RTT samples use
-    /// `TransportClock` itself, since the engine stamps packets with it.
+    /// pacing, the shutdown deadline) reads it. The pacing delay and the
+    /// shutdown's backstop are still slept in real time. Only RTT samples
+    /// use `TransportClock` itself, since the engine stamps packets with it.
     /// Tests pass a clock they move by hand. (Waycar patch.)
     private let clock: @Sendable () -> UInt64
 

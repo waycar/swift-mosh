@@ -526,6 +526,8 @@ final class CoreAndAdapterTests: XCTestCase {
     }
 
     func testJitterSimulationPreservesOrderingAndSessionHealth() async throws {
+        // No retransmission or heartbeat within the waits: the first two
+        // datagrams the server sees are the two states, once each.
         var config = MoshClientConfig(
             sendMinDelayMs: 0,
             maxReceiveStates: 8,
@@ -533,9 +535,9 @@ final class CoreAndAdapterTests: XCTestCase {
             ackDelayMs: 100,
             networkTimeoutMs: 60_000,
             maxRetransmitCount: 4,
-            initialRtoMs: 100,
-            maxRtoMs: 100,
-            heartbeatIntervalMs: 10_000,
+            initialRtoMs: 60_000,
+            maxRtoMs: 60_000,
+            heartbeatIntervalMs: 60_000,
             mtu: 256,
             useNetworkCrypto: false
         )
@@ -748,6 +750,7 @@ final class CoreAndAdapterTests: XCTestCase {
         let ackInstruction = try decodeInstructionPayload(ackPayload.payload, compressed: true)
         XCTAssertNil(ackInstruction.diff)
         XCTAssertEqual(ackInstruction.ackNum, 1)
+        XCTAssertEqual(ackInstruction.newNum, 0, "an ack carries no new client state")
 
         // The heartbeat is a new client state, so it would show as pending.
         clock.advance(byMs: 249)
@@ -760,6 +763,10 @@ final class CoreAndAdapterTests: XCTestCase {
         let heartbeatInstruction = try decodeInstructionPayload(heartbeatPayload.payload, compressed: true)
         XCTAssertNil(heartbeatInstruction.diff)
         XCTAssertEqual(heartbeatInstruction.ackNum, 1)
+        XCTAssertEqual(heartbeatInstruction.oldNum, 0)
+        XCTAssertEqual(heartbeatInstruction.newNum, 1, "the heartbeat is the first new client state")
+        let pendingHeartbeat = await session._testPendingOutboundCount()
+        XCTAssertEqual(pendingHeartbeat, 1, "the heartbeat waits for its ack")
 
         await session.stop()
         await server.stop()
@@ -775,7 +782,7 @@ final class CoreAndAdapterTests: XCTestCase {
             maxRetransmitCount: 3,
             initialRtoMs: 100,
             maxRtoMs: 100,
-            heartbeatIntervalMs: 10_000,
+            heartbeatIntervalMs: 60_000,
             mtu: 256,
             useNetworkCrypto: false
         )
@@ -801,6 +808,7 @@ final class CoreAndAdapterTests: XCTestCase {
         let ackInstruction = try decodeInstructionPayload(ackPayload.payload, compressed: true)
         XCTAssertNil(ackInstruction.diff)
         XCTAssertEqual(ackInstruction.ackNum, 1)
+        XCTAssertEqual(ackInstruction.newNum, 0, "an ack carries no new client state")
 
         await session.stop()
         await server.stop()

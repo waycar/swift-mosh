@@ -247,6 +247,10 @@ final class MoshProtocolE2ETests: XCTestCase {
         var config = MoshClientConfig()
         config.useNetworkCrypto = true
         config.sendMinDelayMs = 0 // No throttle for test
+        // The echo server echoes every keystroke state it gets, so a
+        // retransmission would echo it twice: none within the waits.
+        config.initialRtoMs = 60_000
+        config.maxRtoMs = 60_000
 
         let session = MoshClientSession(
             endpoint: endpoint,

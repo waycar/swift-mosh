@@ -250,8 +250,10 @@ taken.
     `NetworkDatagramEndpoint`). The internal init takes the session's clock
     (default `TransportClock.nowMs()`), and every window the session
     measures reads it: stall, network timeout, heartbeat, retransmission,
-    acks, pacing and the shutdown deadline. RTT samples keep
-    `TransportClock`, since they compare against timestamps the engine
+    acks, pacing and the shutdown deadline. Two waits stay real-time sleeps
+    whose length it decides: the pacing delay and the shutdown's backstop
+    sleep, which ends a shutdown whose send never completes. RTT samples
+    keep `TransportClock`, since they compare against timestamps the engine
     stamps with it. Tests that assert on those windows pass a clock they
     move by hand (`ManualClock`), so a loaded Mac's scheduler pause is not
     silence: CI on the shared runner saw `[connected, stalled, connected]`

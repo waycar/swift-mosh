@@ -196,25 +196,33 @@ final class WaycarPatchTests: XCTestCase {
     }
 
     func testShutdownGivesUpOnASilentServerAtItsDeadline() async throws {
-        let (session, server, serverEnd) = try await makeLinkedSession(config: MoshClientConfig())
+        // The resends and the deadline run on a clock only the test moves;
+        // the shutdown's real-time backstop is beyond the wait ceiling.
+        let clock = ManualClock()
+        let (session, server, serverEnd) = try await makeLinkedSession(config: MoshClientConfig(), clock: clock)
         let log = AckLog()
         let recorder = recordAcks(from: server, into: log)
+        let shutdownStates: @Sendable () async -> Int = { await log.newNums().filter { $0 == UInt64.max }.count }
 
-        let started = TransportClock.nowMs()
         let (finished, finish) = AsyncStream<Void>.makeStream()
         Task {
-            await session.shutdown(ackTimeoutMs: 300)
+            await session.shutdown(ackTimeoutMs: 60_000)
             finish.finish()
         }
+        let sent = await waitUntil { await shutdownStates() == 1 }
+        XCTAssertTrue(sent)
+        clock.advance(byMs: 100)
+        let resent = await waitUntil { await shutdownStates() == 2 }
+        XCTAssertTrue(resent, "a lost shutdown state is resent")
+        let waiting = await session.state
+        XCTAssertEqual(waiting, .stopping, "the shutdown waits for its ack until the deadline")
+
+        clock.advance(byMs: 60_000)
         let returned = await finishes(finished, within: waitCeilingSeconds)
 
-        XCTAssertTrue(returned, "an unreachable server must not hold the shutdown")
-        XCTAssertGreaterThanOrEqual(
-            TransportClock.nowMs() - started, 300, "the shutdown state is resent until the deadline")
+        XCTAssertTrue(returned, "an unreachable server must not hold the shutdown past its deadline")
         let state = await session.state
         XCTAssertEqual(state, .stopped)
-        let sent = await log.count()
-        XCTAssertGreaterThan(sent, 1, "a lost shutdown state is resent")
         await serverEnd.stop()
         await recorder.value
     }
