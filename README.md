@@ -8,7 +8,7 @@ model, with no C code and no GPL code.
 transport, crypto and session layers are
 [wiedymi/swift-mosh](https://github.com/wiedymi/swift-mosh) `v0.1.8` (MIT),
 unchanged where no patch says otherwise; its full README is
-[UPSTREAM-README.md](UPSTREAM-README.md). This fork carries the 16 patches the
+[UPSTREAM-README.md](UPSTREAM-README.md). This fork carries the 17 patches the
 [Waycar](https://waycar.dev) iOS app
 ([source](https://github.com/waycar/waycar-app)) ships on top, so that other apps can use
 them while we offer them upstream. If upstream takes a patch, it leaves this
